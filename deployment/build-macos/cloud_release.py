@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -32,6 +33,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 from pathlib import Path, PurePosixPath
 from zipfile import ZIP_STORED, ZipFile, ZipInfo
@@ -554,7 +556,7 @@ def write_app_zip(app: Path, target) -> None:
                     shutil.copyfileobj(src, dst, 4 * 1024 * 1024)
 
 
-def notarize(app: Path, work: Path, api_raw: str, evidence: dict) -> None:
+def notarize(app: Path, work: Path, api_raw: str, evidence: dict, progress_path: Path) -> None:
     issuer, key_id, pem = convert_api_json(api_raw)
     api_file = work / "notary-key.p8"
     private_write(api_file, pem)
@@ -571,19 +573,44 @@ def notarize(app: Path, work: Path, api_raw: str, evidence: dict) -> None:
     print("Packaging native signed app for Apple notarization.", flush=True)
     write_app_zip(app, archive)
     submitted_sha = sha256_file(archive)
-    args = ["/usr/bin/xcrun", "notarytool", "submit", str(archive), "--key", str(api_file),
-            "--key-id", key_id, "--issuer", issuer, "--wait", "--timeout", "10m", "--output-format", "json"]
-    result = command(args, "Apple notarization", timeout=650, check=False)
+    auth = ["--key", str(api_file), "--key-id", key_id, "--issuer", issuer]
+    print("Uploading notarization ZIP to Apple (separate upload timeout: 600s).", flush=True)
+    upload_started = time.monotonic()
+    result = command(["/usr/bin/xcrun", "notarytool", "submit", str(archive), *auth,
+                      "--no-wait", "--output-format", "json"],
+                     "Apple notarization upload", timeout=600, check=False)
     try:
         response = json.loads(result.stdout)
-        status, submission_id = response.get("status"), response.get("id")
+        submission_id = response.get("id")
         require(isinstance(submission_id, str) and str(uuid.UUID(submission_id)) == submission_id.lower(),
                 "Apple notarization did not return a submission ID.")
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         raise PipelineError("Apple notarization did not return a valid JSON result.") from None
-    evidence["notarization"] = {"status": status, "submission_id": submission_id,
-                                "submitted_zip_sha256": submitted_sha, "submitted_zip_size": archive.stat().st_size}
+    evidence["notarization"] = {"status": "Submitted" if result.returncode == 0 else "UploadUnconfirmed",
+                                "submission_id": submission_id, "submitted_zip_sha256": submitted_sha,
+                                "submitted_zip_size": archive.stat().st_size,
+                                "upload_elapsed_seconds": round(time.monotonic() - upload_started, 3)}
+    # Save a durable, credential-free ID BEFORE waiting. A wait interruption must
+    # never force a duplicate 4GB submission merely to recover its identifier.
+    write_json(progress_path, evidence)
+    print(f"Apple submission ID: {submission_id}; ZIP SHA-256: {submitted_sha}", flush=True)
+    require(result.returncode == 0, "Apple upload was not confirmed; preserved submission ID requires inspection.")
+    print("Waiting on the existing Apple submission (up to 20 minutes).", flush=True)
+    wait_started = time.monotonic()
+    result = command(["/usr/bin/xcrun", "notarytool", "wait", submission_id, *auth,
+                      "--timeout", "20m", "--output-format", "json"],
+                     "Apple notarization wait", timeout=1250, check=False)
+    try:
+        response = json.loads(result.stdout)
+        status = response.get("status")
+        require(response.get("id", submission_id).lower() == submission_id.lower(),
+                "Apple wait returned a different submission ID.")
+    except (ValueError, TypeError, AttributeError):
+        raise PipelineError("Apple wait did not return a valid JSON result; the saved submission ID remains available.") from None
+    evidence["notarization"].update(status=status, wait_elapsed_seconds=round(time.monotonic() - wait_started, 3))
+    write_json(progress_path, evidence)
     require(result.returncode == 0 and status == "Accepted", "Apple has not accepted this app; publication is blocked.")
+    print(f"Apple Accepted: {submission_id}. Stapling and checking native trust.", flush=True)
     archive.unlink()  # Release the 4GB duplicate before packaging final release parts.
     evidence["disk_budget"]["notary_zip_deleted_before_release_packaging"] = not archive.exists()
     api_file.unlink()
@@ -727,39 +754,161 @@ def ensure_release(token: str) -> dict:
     return existing
 
 
-def publish_files(files: list[Path], token: str, evidence: dict) -> None:
+def release_assets(endpoint: str, token: str) -> dict[str, dict]:
+    pages = gh_json(["api", "--paginate", "--slurp", endpoint], token)
+    require(isinstance(pages, list) and all(isinstance(page, list) for page in pages),
+            "Unexpected release assets response.")
+    items = [item for page in pages for item in page]
+    require(all(isinstance(item, dict) and isinstance(item.get("name"), str) for item in items),
+            "Unexpected release asset metadata.")
+    require(len({item["name"] for item in items}) == len(items), "Duplicate remote asset names; refusing ambiguous publication.")
+    return {item["name"]: item for item in items}
+
+
+def asset_matches(asset: dict, expected: dict) -> bool:
+    return (asset.get("name") == expected["name"] and asset.get("state") == "uploaded"
+            and asset.get("size") == expected["size"] and asset.get("digest") == "sha256:" + expected["sha256"])
+
+
+def own_new_empty_starter(asset: dict, expected: dict, baseline_ids: set[int],
+                          attempt_started: float) -> bool:
+    if (not re.fullmatch(r"Orvala-Mac-arm64-1\.0\.4\.zip\.part[0-9]{2}", expected["name"])
+            or asset.get("name") != expected["name"] or asset.get("state") != "starter"
+            or asset.get("size") != 0 or asset.get("digest") not in (None, "")
+            or type(asset.get("id")) is not int or asset["id"] in baseline_ids
+            or not isinstance(asset.get("uploader"), dict)
+            or asset["uploader"].get("login") != "github-actions[bot]"):
+        return False
+    try:
+        created = datetime.fromisoformat(asset["created_at"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return False
+    # GitHub dates have second precision. A very narrow tolerance accommodates
+    # truncation, never a leftover from a preceding run or preflight snapshot.
+    return attempt_started - 2 <= created <= time.time() + 2
+
+
+def verified_asset_record(asset: dict) -> dict:
+    return {key: asset[key] for key in ("id", "name", "size", "digest")}
+
+
+def upload_release_asset(expected: dict, token: str, endpoint: str,
+                         baseline_ids: set[int], *, attempts: int = 3) -> dict:
+    path = expected["path"]
+    name = expected["name"]
+    env = dict(os.environ, GH_TOKEN=token, GH_PROMPT_DISABLED="1")
+    removed_starters = []
+    for attempt in range(1, attempts + 1):
+        before = release_assets(endpoint, token).get(name)
+        if before:
+            require(asset_matches(before, expected), f"Existing asset differs or has no verifiable digest: {name}; refusing to overwrite.")
+            return {**verified_asset_record(before), "attempts": attempt - 1, "removed_own_empty_starters": removed_starters}
+        started = time.time()
+        print(f"Uploading {name}: attempt {attempt}/{attempts}.", flush=True)
+        cli_failed = False
+        try:
+            upload_result = command(["gh", "release", "upload", f"v{VERSION}", str(path), "--repo", REPOSITORY],
+                                    f"Upload own pre-release asset {name}", env=env, timeout=300, check=False)
+            cli_failed = upload_result.returncode != 0
+        except PipelineError:
+            # An HTTP/CLI timeout is ambiguous: the server may already have the
+            # complete bytes. Reconcile exact remote metadata BEFORE any retry.
+            cli_failed = True
+        after = release_assets(endpoint, token).get(name)
+        if after and asset_matches(after, expected):
+            print(f"Verified {name}: asset ID {after['id']} (remote size and SHA-256 match).", flush=True)
+            return {**verified_asset_record(after), "attempts": attempt,
+                    "removed_own_empty_starters": removed_starters}
+        if after:
+            require(cli_failed and own_new_empty_starter(after, expected, baseline_ids, started),
+                    f"Remote asset differs or upload state is ambiguous: {name}; refusing to overwrite or delete.")
+            # Only the empty starter newly created by THIS attempted part upload
+            # can be removed. Bootstrap, existing IDs and uploaded bytes cannot.
+            asset_id = after["id"]
+            fresh = gh_json(["api", f"repos/{REPOSITORY}/releases/assets/{asset_id}"], token)
+            if isinstance(fresh, dict) and asset_matches(fresh, expected):
+                return {**verified_asset_record(fresh), "attempts": attempt,
+                        "removed_own_empty_starters": removed_starters}
+            require(isinstance(fresh, dict) and own_new_empty_starter(fresh, expected, baseline_ids, started)
+                    and fresh["id"] == asset_id,
+                    f"Asset state changed before retry: {name}; refusing deletion.")
+            command(["gh", "api", "--method", "DELETE", f"repos/{REPOSITORY}/releases/assets/{asset_id}"],
+                    f"Remove only this attempt's empty starter for {name}", env=env, timeout=60)
+            require(release_assets(endpoint, token).get(name) is None,
+                    f"Empty starter removal could not be confirmed: {name}.")
+            removed_starters.append(asset_id)
+            print(f"Removed this attempt's empty starter {asset_id} for {name}; no uploaded asset was replaced.", flush=True)
+        if attempt < attempts:
+            print(f"Retrying {name} after remote reconciliation ({attempt * 3}s backoff).", flush=True)
+            time.sleep(attempt * 3)
+    raise PipelineError(f"Upload unresolved after {attempts} reconciled attempts: {name}; manifest was not published.")
+
+
+def publish_files(files: list[Path], token: str, evidence: dict, progress_path: Path) -> None:
     require(os.environ.get("GITHUB_REPOSITORY", "").lower() == REPOSITORY.lower(),
             "Publishing is restricted to the own release repository.")
     release = ensure_release(token)
     endpoint = f"repos/{REPOSITORY}/releases/{release['id']}/assets"
-    assets = gh_json(["api", "--paginate", "--slurp", endpoint], token)
-    require(isinstance(assets, list), "Unexpected release assets response.")
-    existing = {item["name"]: item for page in assets for item in page}
+    existing = release_assets(endpoint, token)
+    baseline_ids = {item["id"] for item in existing.values()}
     # Preflight every existing name before uploading ANY new asset. Never --clobber.
-    pending, reused = [], []
+    pending, reused, expected_files = [], [], []
     for path in files:
-        digest, size = sha256_file(path), path.stat().st_size
+        expected = {"path": path, "name": path.name, "sha256": sha256_file(path), "size": path.stat().st_size}
+        expected_files.append(expected)
         asset = existing.get(path.name)
         if asset:
-            require(asset.get("size") == size and asset.get("digest") == "sha256:" + digest,
+            require(asset_matches(asset, expected),
                     f"Existing asset differs or has no verifiable digest: {path.name}; refusing to overwrite.")
             reused.append(path.name)
         else:
-            pending.append(path)
-    env = dict(os.environ, GH_TOKEN=token, GH_PROMPT_DISABLED="1")
-    # The manifest is last: a failed large upload cannot announce an incomplete package.
-    for path in pending:
-        command(["gh", "release", "upload", f"v{VERSION}", str(path), "--repo", REPOSITORY],
-                "Upload own pre-release asset", env=env, timeout=300)
-    refreshed = gh_json(["api", "--paginate", "--slurp", endpoint], token)
-    verified = {item["name"]: item for page in refreshed for item in page}
-    for path in files:
-        item = verified.get(path.name, {})
-        require(item.get("size") == path.stat().st_size and item.get("digest") == "sha256:" + sha256_file(path),
-                f"Published asset digest could not be verified: {path.name}.")
+            pending.append(expected)
+    parts = [item for item in expected_files if re.fullmatch(r"Orvala-Mac-arm64-1\.0\.4\.zip\.part[0-9]{2}", item["name"])]
+    require(len(parts) == len(PART_SPECS), "All seven final release parts must be present before publication.")
+    auxiliary_names = (BOOTSTRAP_NAME, "macos-1.0.4-evidence.json", "macos-arm64.json")
+    require({item["name"] for item in expected_files} == {item["name"] for item in parts} | set(auxiliary_names),
+            "Unexpected release publication file set.")
+    uploaded_records, failures = [], []
+    evidence["publication_progress"] = {"verified_new_part_assets": [], "all_seven_remote_parts_verified": False,
+                                        "manifest_published": False}
+    write_json(progress_path, evidence)
+    pending_parts = [item for item in pending if item in parts]
+    print(f"Publishing {len(pending_parts)} pending parts with at most 3 concurrent uploads.", flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(upload_release_asset, item, token, endpoint, baseline_ids): item["name"] for item in pending_parts}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                uploaded_records.append(future.result())
+            except PipelineError as error:
+                failures.append(str(error))
+            evidence["publication_progress"]["verified_new_part_assets"] = sorted(uploaded_records, key=lambda item: item["name"])
+            write_json(progress_path, evidence)
+    require(not failures, failures[0] if failures else "Part upload failed.")
+    remote = release_assets(endpoint, token)
+    require(all(asset_matches(remote.get(item["name"], {}), item) for item in parts),
+            "All seven remote part digests must match before evidence or manifest upload.")
+    evidence["publication_progress"]["all_seven_remote_parts_verified"] = True
+    evidence["publication_progress"]["all_part_assets"] = [verified_asset_record(remote[item["name"]]) for item in parts]
+    write_json(progress_path, evidence)
+    print("All seven remote part sizes and SHA-256 digests verified. Publishing small evidence and manifest last.", flush=True)
+    # Small assets are sequential, strictly after all seven remote parts verify.
+    # The exact bootstrap is always reused when present and never overwritten.
+    for name in auxiliary_names:
+        expected = next(item for item in expected_files if item["name"] == name)
+        if name not in reused:
+            uploaded_records.append(upload_release_asset(expected, token, endpoint, baseline_ids))
+        if name == "macos-arm64.json":
+            evidence["publication_progress"]["manifest_published"] = True
+            write_json(progress_path, evidence)
+    verified = release_assets(endpoint, token)
+    for expected in expected_files:
+        require(asset_matches(verified.get(expected["name"], {}), expected),
+                f"Published asset digest could not be verified: {expected['name']}.")
     evidence["publication"] = {"repository": REPOSITORY, "tag": f"v{VERSION}", "prerelease": True,
                                "make_latest": False, "reused_assets": reused,
-                               "uploaded_assets": [path.name for path in pending], "remote_asset_digests_verified": True,
+                               "uploaded_assets": [item["name"] for item in pending], "remote_asset_digests_verified": True,
+                               "uploaded_asset_records": sorted(uploaded_records, key=lambda item: item["name"]),
+                               "max_concurrent_part_uploads": 3, "max_upload_attempts": 3,
                                "portal_promoted": False}
 
 
@@ -792,7 +941,7 @@ def cleanup(work: Path) -> None:
 def plan() -> dict:
     return {
         "mode": "offline plan; no network, credentials or external changes", "repository": REPOSITORY,
-        "runner": "standard public macos-15 / Apple Silicon", "timeout_minutes": 20,
+        "runner": "standard public macos-15 / Apple Silicon", "timeout_minutes": 40,
         "target_version": VERSION, "minimum_macos": MINIMUM_MACOS,
         "base": base_manifest(),
         "bootstrap": {"url": BOOTSTRAP_URL, "size": BOOTSTRAP_SIZE, "sha256": BOOTSTRAP_SHA256},
@@ -804,11 +953,11 @@ def plan() -> dict:
                   "Run approved bootstrap JXA, native tar streaming, restore and verify Unix permissions",
                   "Keep PCK and managed assemblies frozen; update bundle version/minimum OS only",
                   "Import leaf Developer ID and pinned official G2 intermediate into an isolated temporary keychain; sign all Mach-O and main bundle",
-                  "Submit to Apple with notarytool (wait at most 10m); require Accepted, staple and verify trust",
+                  "Upload to Apple separately (600s), persist submission ID, then wait on that ID (20m); require Accepted, staple and verify trust",
                   "Delete temporary notary ZIP; create Unix-mode ZIP directly into <=700MB hashed parts",
                   "Delete original temporary app; reextract final parts via hardlinks, restore permissions and reverify Apple trust",
                   "Delete signing keychain/material; run credential-free native .NET library and deck selector smoke (90s)",
-                  "Optionally publish own v1.0.4 pre-release, make_latest=false; never overwrite a different asset",
+                  "Optionally publish own v1.0.4 pre-release with 3 parallel reconciled part uploads; evidence/manifest last after all 7 remote hashes match",
                   "Remove temporary keychain and all secret material even on failure"],
         "publication_requires": "--run --publish --confirm-version 1.0.4, authorized temporary secrets, own repo GITHUB_TOKEN",
         "external_mutations": ["Apple notarization submission with --run", "own pre-release assets only with --publish"],
@@ -916,6 +1065,142 @@ class OfflineTests(unittest.TestCase):
         self.assertNotIn("\x1b", diagnostic)
         self.assertNotIn("\x00", diagnostic)
 
+    @staticmethod
+    def upload_fixture():
+        name = "Orvala-Mac-arm64-1.0.4.zip.part01"
+        expected = {"path": Path(name), "name": name, "size": 3, "sha256": hashlib.sha256(b"abc").hexdigest()}
+        asset = {"id": 101, "name": name, "state": "uploaded", "size": 3, "digest": "sha256:" + expected["sha256"]}
+        return expected, asset
+
+    def test_upload_timeout_reconciles_already_accepted_remote_without_retry_or_delete(self):
+        expected, asset = self.upload_fixture()
+        with mock.patch(__name__ + ".release_assets", side_effect=[{}, {expected["name"]: asset}]), \
+             mock.patch(__name__ + ".command", side_effect=PipelineError("fixture timeout")) as cli, \
+             mock.patch(__name__ + ".time.sleep") as pause, mock.patch("builtins.print"):
+            result = upload_release_asset(expected, "fixture-token", "fixture-endpoint", {1})
+        self.assertEqual(result["id"], 101)
+        self.assertEqual(cli.call_count, 1)
+        pause.assert_not_called()
+
+    def test_upload_transient_failure_retries_only_after_remote_absence_is_confirmed(self):
+        expected, asset = self.upload_fixture()
+        failed = subprocess.CompletedProcess([], 1, b"", b"fixture upstream failure")
+        success = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch(__name__ + ".release_assets", side_effect=[{}, {}, {}, {expected["name"]: asset}]), \
+             mock.patch(__name__ + ".command", side_effect=[failed, success]) as cli, \
+             mock.patch(__name__ + ".time.sleep") as pause, mock.patch("builtins.print"):
+            result = upload_release_asset(expected, "fixture-token", "fixture-endpoint", {1})
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(cli.call_count, 2)
+        pause.assert_called_once_with(3)
+
+    def test_upload_different_remote_digest_never_retries_deletes_or_overwrites(self):
+        expected, asset = self.upload_fixture()
+        asset["digest"] = "sha256:" + "f" * 64
+        with mock.patch(__name__ + ".release_assets", side_effect=[{}, {expected["name"]: asset}]), \
+             mock.patch(__name__ + ".command", return_value=subprocess.CompletedProcess([], 1, b"", b"")) as cli, \
+             mock.patch(__name__ + ".time.sleep") as pause, mock.patch("builtins.print"):
+            with self.assertRaises(PipelineError):
+                upload_release_asset(expected, "fixture-token", "fixture-endpoint", {1})
+        self.assertEqual(cli.call_count, 1)
+        pause.assert_not_called()
+
+    def test_only_this_attempts_new_empty_part_starter_can_be_removed_for_retry(self):
+        expected, asset = self.upload_fixture()
+        starter = {"id": 102, "name": expected["name"], "state": "starter", "size": 0, "digest": None,
+                   "uploader": {"login": "github-actions[bot]"},
+                   "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+        self.assertFalse(own_new_empty_starter(starter, expected, {102}, time.time()))
+        self.assertFalse(own_new_empty_starter({**starter, "name": BOOTSTRAP_NAME},
+                                              {**expected, "name": BOOTSTRAP_NAME}, set(), time.time()))
+        self.assertFalse(own_new_empty_starter({**starter, "created_at": "2020-01-01T00:00:00Z"}, expected, set(), time.time()))
+        self.assertFalse(own_new_empty_starter({**starter, "uploader": {"login": "other"}}, expected, set(), time.time()))
+        with mock.patch(__name__ + ".release_assets", side_effect=[{}, {expected["name"]: starter}, {}, {}, {expected["name"]: asset}]), \
+             mock.patch(__name__ + ".gh_json", return_value=starter), \
+             mock.patch(__name__ + ".command", side_effect=[subprocess.CompletedProcess([], 1, b"", b""),
+                                                            subprocess.CompletedProcess([], 0, b"", b""),
+                                                            subprocess.CompletedProcess([], 0, b"", b"")]) as cli, \
+             mock.patch(__name__ + ".time.sleep"), mock.patch("builtins.print"):
+            result = upload_release_asset(expected, "fixture-token", "fixture-endpoint", {1})
+        self.assertEqual(result["removed_own_empty_starters"], [102])
+        delete_calls = [call.args[0] for call in cli.call_args_list if "DELETE" in call.args[0]]
+        self.assertEqual(len(delete_calls), 1)
+        self.assertTrue(delete_calls[0][-1].endswith("/assets/102"))
+
+    def test_cli_success_with_ambiguous_starter_metadata_is_never_deleted(self):
+        expected, _ = self.upload_fixture()
+        starter = {"id": 102, "name": expected["name"], "state": "starter", "size": 0, "digest": None,
+                   "uploader": {"login": "github-actions[bot]"},
+                   "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+        with mock.patch(__name__ + ".release_assets", side_effect=[{}, {expected["name"]: starter}]), \
+             mock.patch(__name__ + ".command", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as cli, \
+             mock.patch("builtins.print"):
+            with self.assertRaises(PipelineError):
+                upload_release_asset(expected, "fixture-token", "fixture-endpoint", {1})
+        self.assertEqual(cli.call_count, 1)
+
+    def test_wait_timeout_keeps_uploaded_submission_id_durable_before_waiting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            app = work / "Orvala.app"
+            app.mkdir()
+            (app / "fixture").write_bytes(b"fixture")
+            progress = work / "progress.json"
+            api = json.dumps({"issuer_id": "743b00ee-ebbb-407b-ba7b-951fd6ad00d7", "key_id": "FAKEKEY123",
+                              "private_key": base64.b64encode(b"\x30" + bytes(range(1, 100))).decode()})
+            submission_id = "00000000-0000-4000-8000-000000000001"
+            def fake_command(args, label, **kwargs):
+                if "submit" in args:
+                    self.assertIn("--no-wait", args)
+                    self.assertNotIn("--wait", args)
+                    self.assertEqual(kwargs["timeout"], 600)
+                    return subprocess.CompletedProcess(args, 0, json.dumps({"id": submission_id}).encode(), b"")
+                self.assertIn("wait", args)
+                self.assertEqual(kwargs["timeout"], 1250)
+                self.assertEqual(json.loads(progress.read_text())["notarization"]["submission_id"], submission_id)
+                raise PipelineError("fixture wait timeout")
+            def fake_zip(app_path, target):
+                target.write_bytes(b"fixture-public-zip")
+            with mock.patch(__name__ + ".command", side_effect=fake_command), \
+                 mock.patch(__name__ + ".write_app_zip", side_effect=fake_zip), \
+                 mock.patch(__name__ + ".shutil.disk_usage", return_value=type("Disk", (), {"free": 2**40})()), \
+                 mock.patch("builtins.print"):
+                with self.assertRaises(PipelineError):
+                    notarize(app, work, api, {}, progress)
+            saved = json.loads(progress.read_text())
+            self.assertEqual(saved["notarization"]["status"], "Submitted")
+            self.assertEqual(saved["notarization"]["submission_id"], submission_id)
+            self.assertNotIn("private_key", progress.read_text())
+            self.assertNotIn("FAKEKEY123", progress.read_text())
+
+    def test_partial_part_upload_failure_blocks_all_small_publication_assets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            names = [f"Orvala-Mac-arm64-1.0.4.zip.part{index:02d}" for index in range(1, 8)]
+            names += [BOOTSTRAP_NAME, "macos-1.0.4-evidence.json", "macos-arm64.json"]
+            files = []
+            for name in names:
+                path = root / name
+                path.write_bytes(name.encode())
+                files.append(path)
+            attempted = []
+            def fake_upload(expected, *args, **kwargs):
+                attempted.append(expected["name"])
+                if expected["name"].endswith("part03"):
+                    raise PipelineError("fixture part03 upload failed")
+                return {"id": 100 + len(attempted), "name": expected["name"], "size": expected["size"],
+                        "digest": "sha256:" + expected["sha256"]}
+            with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": REPOSITORY}), \
+                 mock.patch(__name__ + ".ensure_release", return_value={"id": 42}), \
+                 mock.patch(__name__ + ".release_assets", return_value={}), \
+                 mock.patch(__name__ + ".upload_release_asset", side_effect=fake_upload), mock.patch("builtins.print"):
+                with self.assertRaises(PipelineError):
+                    publish_files(files, "fixture-token", {}, root / "progress.json")
+            self.assertEqual(len(attempted), 7)
+            self.assertTrue(all(".zip.part" in name for name in attempted))
+            progress = json.loads((root / "progress.json").read_text())
+            self.assertFalse(progress["publication_progress"]["manifest_published"])
+
 
 def run(args) -> None:
     require(sys.platform == "darwin" and platform.machine() == "arm64", "--run requires a native Apple Silicon macOS runner.")
@@ -952,7 +1237,7 @@ def run(args) -> None:
         keychain, identity = import_identity(work, credentials)
         print("Signing frozen native code with Developer ID in a temporary keychain.", flush=True)
         sign_game(app, work, keychain, identity, evidence)
-        notarize(app, work, credentials[SECRET_NAMES[2]], evidence)
+        notarize(app, work, credentials[SECRET_NAMES[2]], evidence, output / "run-result.json")
         credentials.clear()
         verify_file(app / "Contents/Resources/Orvala.pck", PCK_SIZE, PCK_SHA256)
         print("Packing the accepted, stapled app directly into release parts.", flush=True)
@@ -971,9 +1256,12 @@ def run(args) -> None:
         manifest_path = output / "macos-arm64.json"
         write_json(manifest_path, manifest)
         verified_app = verify_final_roundtrip(app, output, work, validator, manifest, target.parts, evidence)
+        print("Final release parts reextracted, permissions restored, Apple trust verified.", flush=True)
         remove_signing_material(work, evidence)
         require(not credentials, "Credential memory must be cleared before executing the game.")
+        print("Signing material removed. Starting credential-free native .NET library smoke.", flush=True)
         native_library_smoke(verified_app, work, evidence)
+        print("Native .NET library, starter deck selector and return smoke PASS.", flush=True)
         evidence["final_package"] = {"sha256": manifest["sha256"], "size": manifest["size"],
                                      "parts": target.parts, "final_reextraction_and_trust": True,
                                      "notarized_flag_requires_accepted_and_trust": True,
@@ -987,7 +1275,7 @@ def run(args) -> None:
             files = [output / part["name"] for part in target.parts]
             # Evidence is already safe to publish; publication details stay local
             # after upload, avoiding a changing same-name asset on retries.
-            publish_files([*files, bootstrap_asset, evidence_path, manifest_path], token, evidence)
+            publish_files([*files, bootstrap_asset, evidence_path, manifest_path], token, evidence, output / "run-result.json")
             evidence["status"] = "published_prerelease_without_portal_promotion"
         else:
             evidence["publication"] = {"performed": False}

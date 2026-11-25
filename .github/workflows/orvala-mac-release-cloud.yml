@@ -47,7 +47,7 @@ jobs:
   release:
     if: github.repository == 'DaneAz61/orvala-releases' && inputs.operation == 'publish' && inputs.confirm_version == '1.0.4'
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 40
     permissions:
       contents: write
     steps:
