@@ -6,14 +6,14 @@ on:
   workflow_dispatch:
     inputs:
       manifest_sha256:
-        description: Independently approved SHA-256 of own v1.0.4 macos-arm64.json
+        description: Independently approved SHA-256 of own v1.0.5 macos-arm64.json
         required: true
         type: string
       confirm_version:
-        description: Type 1.0.4 to test only the already-published own package
+        description: Type 1.0.5 to test only the already-published own package
         required: true
         type: string
-        default: '1.0.4'
+        default: '1.0.5'
       runner_image:
         description: Standard public ARM64 runner; never a larger paid runner
         required: true
@@ -23,7 +23,7 @@ on:
           - macos-26
           - macos-15
       publish_evidence:
-        description: Add unique QA images/logs/JSON to existing own v1.0.4 pre-release only after PASS
+        description: Add unique QA images/logs/JSON to existing own v1.0.5 pre-release only after PASS
         required: true
         type: boolean
         default: false
@@ -32,13 +32,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: orvala-mac-native-client-104
+  group: orvala-mac-native-client-105
   cancel-in-progress: false
 
 jobs:
   native-client:
     if: >-
-      github.repository == 'DaneAz61/orvala-releases' && inputs.confirm_version == '1.0.4' &&
+      github.repository == 'DaneAz61/orvala-releases' && inputs.confirm_version == '1.0.5' &&
       (inputs.runner_image == 'macos-26' || inputs.runner_image == 'macos-15')
     runs-on: ${{ inputs.runner_image }}
     timeout-minutes: 8

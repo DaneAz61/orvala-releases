@@ -15,7 +15,7 @@ on:
           - plan
           - publish
       confirm_version:
-        description: Type 1.0.4 to authorize the selected publish run
+        description: Type 1.0.5 to authorize the selected publish run
         required: false
         type: string
         default: ''
@@ -45,7 +45,7 @@ jobs:
           python3 deployment/build-macos/cloud_release.py --self-test
 
   release:
-    if: github.repository == 'DaneAz61/orvala-releases' && inputs.operation == 'publish' && inputs.confirm_version == '1.0.4'
+    if: github.repository == 'DaneAz61/orvala-releases' && inputs.operation == 'publish' && inputs.confirm_version == '1.0.5'
     runs-on: macos-15
     timeout-minutes: 40
     permissions:
@@ -75,7 +75,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           python3 deployment/build-macos/cloud_release.py
-          --run --publish --confirm-version 1.0.4
+          --run --publish --confirm-version 1.0.5
           --work-dir "$ORVALA_WORK_DIR" --output-dir "$ORVALA_OUTPUT_DIR"
       - name: Remove temporary keychain and signing material
         if: always()

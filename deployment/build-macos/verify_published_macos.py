@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Credential-free client QA of the own, already-published Mac 1.0.4 package.
+"""Credential-free client QA of the own, already-published Mac 1.0.5 package.
 
 This contains distribution/test orchestration only, never game source or assets.
 The default plan and --self-test are offline. --run downloads only the own public
 hash-pinned release; it never signs, notarizes, logs in or changes the portal.
 --publish-evidence is a separate process with the own built-in GitHub token and
-can only add unique QA assets to the existing v1.0.4 pre-release after PASS.
+can only add unique QA assets to the existing v1.0.5 pre-release after PASS.
 """
 
 from __future__ import annotations
@@ -33,10 +33,15 @@ from unittest import mock
 import cloud_release as cloud
 
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 REPOSITORY = "DaneAz61/orvala-releases"
 MANIFEST_URL = f"https://github.com/{REPOSITORY}/releases/download/v{VERSION}/macos-arm64.json"
+BOOTSTRAP_VERSION = "1.0.4"
+BOOTSTRAP_NAME = f"Instalar-Orvala-Mac-{BOOTSTRAP_VERSION}.zip"
+BOOTSTRAP_URL = f"https://github.com/{REPOSITORY}/releases/download/v{BOOTSTRAP_VERSION}/{BOOTSTRAP_NAME}"
+BOOTSTRAP_SIZE = 1_364_034
 BOOTSTRAP_SHA256 = "01e958b0a74e5d19c5ccef0e4f5e204d2dfe985b8d7101ddada487daa418d038"
+PCK_SIZE = 4_192_008_472
 PCK_SHA256 = "69a41ae720bc2d989d48c5f2b15c4950f83c513dec0bf3f5b84988285e5bb3e5"
 MENU_MARKER = "ORVALA MENUS SMOKE OK: início, acesso ao mundo, coleção, seletor, retratos e miniatura original animada."
 MARKER_FILE = ".orvala-native-client-owned"
@@ -66,6 +71,15 @@ def valid_sha256(value: str) -> str:
     return value.lower()
 
 
+def validate_imported_constants() -> None:
+    require(cloud.VERSION == VERSION and cloud.BASE_VERSION == "1.0.3" and cloud.REPOSITORY == REPOSITORY
+            and cloud.BOOTSTRAP_VERSION == BOOTSTRAP_VERSION
+            and cloud.BOOTSTRAP_NAME == BOOTSTRAP_NAME and cloud.BOOTSTRAP_URL == BOOTSTRAP_URL
+            and cloud.BOOTSTRAP_SIZE == BOOTSTRAP_SIZE and cloud.BOOTSTRAP_SHA256 == BOOTSTRAP_SHA256
+            and cloud.PCK_SIZE == PCK_SIZE and cloud.PCK_SHA256 == PCK_SHA256,
+            "Imported helpers must match game 1.0.5, frozen 1.0.3 payload and the exact approved 1.0.4 bootstrap origin.")
+
+
 def no_duplicate_keys(pairs):
     result = {}
     for key, value in pairs:
@@ -85,7 +99,7 @@ def parse_manifest(data: bytes, expected_hash: str) -> dict:
     require(isinstance(manifest, dict) and manifest.get("version") == VERSION
             and manifest.get("platform") == "macos-arm64" and manifest.get("application") == "Orvala.app"
             and manifest.get("minimum_macos") == "13.0" and manifest.get("notarized") is True
-            and manifest.get("status") == "stable", "Published manifest is not the approved notarized Mac 1.0.4 release.")
+            and manifest.get("status") == "stable", "Published manifest is not the approved notarized Mac 1.0.5 release.")
     require(type(manifest.get("size")) is int and cloud.PCK_SIZE < manifest["size"] <= 8 * 1024**3,
             "Unexpected final game package size.")
     valid_sha256(manifest.get("sha256"))
@@ -271,8 +285,9 @@ def unpack_published(manifest: dict, work: Path, validator: Path, evidence: dict
     cloud.verify_file(app / "Contents/Resources/Orvala.pck", cloud.PCK_SIZE, PCK_SHA256)
     info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
     require(info.get("CFBundleIdentifier") == "br.com.playable.orvala" and info.get("CFBundleExecutable") == "Orvala"
-            and info.get("CFBundleShortVersionString") == VERSION and info.get("LSMinimumSystemVersion") == "13.0",
-            "Final game metadata differs from the approved Mac 1.0.4 package.")
+            and info.get("CFBundleShortVersionString") == VERSION and info.get("CFBundleVersion") == VERSION
+            and info.get("LSMinimumSystemVersion") == "13.0",
+            "Final game metadata differs from the approved Mac 1.0.5 package.")
     cloud.trust(app, prefix="published_game_trust", evidence=evidence)
     description = cloud.command(["/usr/bin/codesign", "--display", "--verbose=4", str(app)],
                                 "Published game signing identity").stderr.decode("utf-8", "replace")
@@ -341,7 +356,7 @@ def upload_qa(work: Path, manifest_sha: str, run_id: str, attempt: str) -> None:
     release = cloud.gh_json(["api", f"repos/{REPOSITORY}/releases/tags/v{VERSION}"], token)
     require(isinstance(release, dict) and release.get("tag_name") == f"v{VERSION}"
             and release.get("prerelease") is True and release.get("draft") is False,
-            "QA evidence requires the existing public v1.0.4 pre-release; no release will be created or changed.")
+            "QA evidence requires the existing public v1.0.5 pre-release; no release will be created or changed.")
     endpoint = f"repos/{REPOSITORY}/releases/{release['id']}/assets"
     pages = cloud.gh_json(["api", "--paginate", "--slurp", endpoint], token)
     require(isinstance(pages, list) and all(isinstance(page, list) for page in pages), "Unexpected own release asset inventory.")
@@ -362,11 +377,13 @@ def upload_qa(work: Path, manifest_sha: str, run_id: str, attempt: str) -> None:
     for source, name in names.items():
         require(name in actual and actual[name].get("size") == source.stat().st_size
                 and actual[name].get("digest") == "sha256:" + cloud.sha256_file(source), "Uploaded QA asset integrity was not confirmed.")
-    print(f"PASS: {len(files)} unique QA assets verified on the existing own v1.0.4 pre-release; no game asset or release state was changed.")
+    print(f"PASS: {len(files)} unique QA assets verified on the existing own v1.0.5 pre-release; no game asset or release state was changed.")
 
 
 def plan(manifest_sha: str) -> dict:
     return {"version": VERSION, "manifest_url": MANIFEST_URL, "manifest_sha256": manifest_sha,
+            "bootstrap": {"version": BOOTSTRAP_VERSION, "name": BOOTSTRAP_NAME, "url": BOOTSTRAP_URL,
+                          "size": BOOTSTRAP_SIZE, "sha256": BOOTSTRAP_SHA256},
             "bootstrap_sha256": BOOTSTRAP_SHA256, "frozen_pck_sha256": PCK_SHA256,
             "run_contacts": ["own public release downloads", "Apple public trust/ticket checks"],
             "game_network_login": False, "apple_credentials_required": False, "private_sources_required": False,
@@ -383,8 +400,7 @@ def run(args, manifest_sha: str, run_id: str, attempt: str) -> int:
             "Native client QA is restricted to the own public repository's disposable hosted runner.")
     require(not any(os.environ.get(name) for name in (*cloud.SECRET_NAMES, "GH_TOKEN", "GITHUB_TOKEN")),
             "Client QA must start without Apple credentials or a release token.")
-    require(cloud.VERSION == VERSION and cloud.REPOSITORY == REPOSITORY and cloud.BOOTSTRAP_SHA256 == BOOTSTRAP_SHA256
-            and cloud.PCK_SHA256 == PCK_SHA256, "Imported distribution helpers differ from the approved 1.0.4 constants.")
+    validate_imported_constants()
     work = args.work_dir.resolve()
     require(work.name.startswith("orvala-mac-native-client-") and not work.exists(), "Use a new exclusive client-QA workspace.")
     work.mkdir(parents=True, mode=0o700)
@@ -489,14 +505,36 @@ class OfflineTests(unittest.TestCase):
             parse_manifest(*self.encode(value))
 
     def test_manifest_rejects_beta_wrong_minimum_and_boolean_size(self):
-        for changes in ({"notarized": False}, {"version": "1.0.3"}, {"minimum_macos": "12.0"}, {"size": True}):
+        for changes in ({"notarized": False}, {"version": "1.0.3"}, {"version": "1.0.4"},
+                        {"minimum_macos": "12.0"}, {"size": True}):
             value = self.manifest()
             value.update(changes)
             with self.subTest(changes=changes), self.assertRaises(cloud.PipelineError):
                 parse_manifest(*self.encode(value))
 
+    def test_previous_game_parts_cannot_mix_with_final_manifest(self):
+        value = self.manifest()
+        value["parts"][0]["url"] = f"{cloud.RELEASE_ROOT}/v1.0.4/Orvala-Mac-arm64-1.0.4.zip.part01"
+        with self.assertRaises(cloud.PipelineError):
+            parse_manifest(*self.encode(value))
+
+    def test_imported_constants_pin_old_bootstrap_and_new_game_separately(self):
+        approved = dict(VERSION=VERSION, BASE_VERSION="1.0.3", REPOSITORY=REPOSITORY,
+                        BOOTSTRAP_VERSION=BOOTSTRAP_VERSION, BOOTSTRAP_NAME=BOOTSTRAP_NAME, BOOTSTRAP_URL=BOOTSTRAP_URL,
+                        BOOTSTRAP_SIZE=BOOTSTRAP_SIZE, BOOTSTRAP_SHA256=BOOTSTRAP_SHA256,
+                        PCK_SIZE=PCK_SIZE, PCK_SHA256=PCK_SHA256)
+        with mock.patch.multiple(cloud, **approved):
+            validate_imported_constants()
+            for name, wrong in (("VERSION", "1.0.4"), ("BASE_VERSION", "1.0.4"),
+                                ("BOOTSTRAP_URL", BOOTSTRAP_URL.replace("/v1.0.4/", "/v1.0.5/")),
+                                ("BOOTSTRAP_VERSION", "1.0.5"), ("BOOTSTRAP_NAME", "Instalar-Orvala-Mac-1.0.5.zip"),
+                                ("BOOTSTRAP_SIZE", BOOTSTRAP_SIZE + 1), ("PCK_SHA256", "0" * 64)):
+                with self.subTest(name=name), mock.patch.object(cloud, name, wrong), self.assertRaises(cloud.PipelineError):
+                    validate_imported_constants()
+        self.assertEqual(plan("a" * 64)["bootstrap"]["version"], "1.0.4")
+
     def test_duplicate_json_keys_are_rejected(self):
-        data = b'{"version":"1.0.4","version":"1.0.3"}'
+        data = b'{"version":"1.0.5","version":"1.0.4"}'
         with self.assertRaises(cloud.PipelineError):
             parse_manifest(data, hashlib.sha256(data).hexdigest())
 
@@ -630,7 +668,7 @@ def main(argv=None) -> int:
     mode.add_argument("--run", action="store_true", help="Download and test the exact already-published own package on disposable Mac CI.")
     mode.add_argument("--publish-evidence", action="store_true", help="Only upload bounded QA assets after an earlier PASS; never run the game with a token.")
     mode.add_argument("--report", action="store_true", help="Print safe completed local evidence only.")
-    parser.add_argument("--manifest-sha256", default="", help="Required independently approved SHA-256 of the own v1.0.4 manifest.")
+    parser.add_argument("--manifest-sha256", default="", help="Required independently approved SHA-256 of the own v1.0.5 manifest.")
     parser.add_argument("--work-dir", type=Path, default=Path(tempfile.gettempdir()) / "orvala-mac-native-client-local")
     parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", ""))
     parser.add_argument("--attempt", default=os.environ.get("GITHUB_RUN_ATTEMPT", "1"))

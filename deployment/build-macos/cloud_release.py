@@ -40,7 +40,7 @@ from zipfile import ZIP_STORED, ZipFile, ZipInfo
 
 
 REPOSITORY = "DaneAz61/orvala-releases"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 BASE_VERSION = "1.0.3"
 TEAM_ID = "WN9MP7LBRW"
 MINIMUM_MACOS = "13.0"
@@ -49,13 +49,15 @@ BASE_SHA256 = "aabd0a7e2dde7ee0f157549bcca8b30d39b7e70989a86cf98617ebb28757fd64"
 PCK_SIZE = 4_192_008_472
 PCK_SHA256 = "69a41ae720bc2d989d48c5f2b15c4950f83c513dec0bf3f5b84988285e5bb3e5"
 BOOTSTRAP_NAME = "Instalar-Orvala-Mac-1.0.4.zip"
+BOOTSTRAP_VERSION = "1.0.4"
 BOOTSTRAP_SIZE = 1_364_034
 BOOTSTRAP_SHA256 = "01e958b0a74e5d19c5ccef0e4f5e204d2dfe985b8d7101ddada487daa418d038"
 DEVELOPER_ID_CA_URL = "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer"
 DEVELOPER_ID_CA_SIZE = 1_090
 DEVELOPER_ID_CA_SHA256 = "f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a"
 RELEASE_ROOT = f"https://github.com/{REPOSITORY}/releases/download"
-BOOTSTRAP_URL = f"{RELEASE_ROOT}/v{VERSION}/{BOOTSTRAP_NAME}"
+BOOTSTRAP_URL = f"{RELEASE_ROOT}/v{BOOTSTRAP_VERSION}/{BOOTSTRAP_NAME}"
+EVIDENCE_NAME = f"macos-{VERSION}-evidence.json"
 PART_LIMIT = 700_000_000
 RESERVE = 512 * 1024 * 1024
 ZIP_METADATA_BUDGET = 64 * 1024 * 1024
@@ -770,9 +772,13 @@ def asset_matches(asset: dict, expected: dict) -> bool:
             and asset.get("size") == expected["size"] and asset.get("digest") == "sha256:" + expected["sha256"])
 
 
+def is_current_release_part(name: str) -> bool:
+    return re.fullmatch(re.escape(f"Orvala-Mac-arm64-{VERSION}.zip.part") + r"[0-9]{2}", name) is not None
+
+
 def own_new_empty_starter(asset: dict, expected: dict, baseline_ids: set[int],
                           attempt_started: float) -> bool:
-    if (not re.fullmatch(r"Orvala-Mac-arm64-1\.0\.4\.zip\.part[0-9]{2}", expected["name"])
+    if (not is_current_release_part(expected["name"])
             or asset.get("name") != expected["name"] or asset.get("state") != "starter"
             or asset.get("size") != 0 or asset.get("digest") not in (None, "")
             or type(asset.get("id")) is not int or asset["id"] in baseline_ids
@@ -863,9 +869,9 @@ def publish_files(files: list[Path], token: str, evidence: dict, progress_path: 
             reused.append(path.name)
         else:
             pending.append(expected)
-    parts = [item for item in expected_files if re.fullmatch(r"Orvala-Mac-arm64-1\.0\.4\.zip\.part[0-9]{2}", item["name"])]
+    parts = [item for item in expected_files if is_current_release_part(item["name"])]
     require(len(parts) == len(PART_SPECS), "All seven final release parts must be present before publication.")
-    auxiliary_names = (BOOTSTRAP_NAME, "macos-1.0.4-evidence.json", "macos-arm64.json")
+    auxiliary_names = (BOOTSTRAP_NAME, EVIDENCE_NAME, "macos-arm64.json")
     require({item["name"] for item in expected_files} == {item["name"] for item in parts} | set(auxiliary_names),
             "Unexpected release publication file set.")
     uploaded_records, failures = [], []
@@ -944,7 +950,10 @@ def plan() -> dict:
         "runner": "standard public macos-15 / Apple Silicon", "timeout_minutes": 40,
         "target_version": VERSION, "minimum_macos": MINIMUM_MACOS,
         "base": base_manifest(),
-        "bootstrap": {"url": BOOTSTRAP_URL, "size": BOOTSTRAP_SIZE, "sha256": BOOTSTRAP_SHA256},
+        "bootstrap_launcher_version": BOOTSTRAP_VERSION,
+        "bootstrap": {"launcher_version": BOOTSTRAP_VERSION, "url": BOOTSTRAP_URL,
+                      "size": BOOTSTRAP_SIZE, "sha256": BOOTSTRAP_SHA256,
+                      "approved_signed_notarized_bytes_reused": True},
         "public_intermediate": {"url": DEVELOPER_ID_CA_URL, "size": DEVELOPER_ID_CA_SIZE,
                                 "sha256": DEVELOPER_ID_CA_SHA256},
         "pck": {"size": PCK_SIZE, "sha256": PCK_SHA256}, "temporary_secret_names": list(SECRET_NAMES),
@@ -957,9 +966,9 @@ def plan() -> dict:
                   "Delete temporary notary ZIP; create Unix-mode ZIP directly into <=700MB hashed parts",
                   "Delete original temporary app; reextract final parts via hardlinks, restore permissions and reverify Apple trust",
                   "Delete signing keychain/material; run credential-free native .NET library and deck selector smoke (90s)",
-                  "Optionally publish own v1.0.4 pre-release with 3 parallel reconciled part uploads; evidence/manifest last after all 7 remote hashes match",
+                  f"Optionally publish own v{VERSION} pre-release with 3 parallel reconciled part uploads; evidence/manifest last after all 7 remote hashes match",
                   "Remove temporary keychain and all secret material even on failure"],
-        "publication_requires": "--run --publish --confirm-version 1.0.4, authorized temporary secrets, own repo GITHUB_TOKEN",
+        "publication_requires": f"--run --publish --confirm-version {VERSION}, authorized temporary secrets, own repo GITHUB_TOKEN",
         "external_mutations": ["Apple notarization submission with --run", "own pre-release assets only with --publish"],
         "does_not_verify": ["Rendered or interactive gameplay", "M5 hardware gameplay", "online login or multiplayer"],
         "portal_promoted": False, "private_game_sources_published": False,
@@ -1067,7 +1076,7 @@ class OfflineTests(unittest.TestCase):
 
     @staticmethod
     def upload_fixture():
-        name = "Orvala-Mac-arm64-1.0.4.zip.part01"
+        name = f"Orvala-Mac-arm64-{VERSION}.zip.part01"
         expected = {"path": Path(name), "name": name, "size": 3, "sha256": hashlib.sha256(b"abc").hexdigest()}
         asset = {"id": 101, "name": name, "state": "uploaded", "size": 3, "digest": "sha256:" + expected["sha256"]}
         return expected, asset
@@ -1113,6 +1122,9 @@ class OfflineTests(unittest.TestCase):
         self.assertFalse(own_new_empty_starter(starter, expected, {102}, time.time()))
         self.assertFalse(own_new_empty_starter({**starter, "name": BOOTSTRAP_NAME},
                                               {**expected, "name": BOOTSTRAP_NAME}, set(), time.time()))
+        old_name = "Orvala-Mac-arm64-1.0.4.zip.part01"
+        self.assertFalse(own_new_empty_starter({**starter, "name": old_name},
+                                              {**expected, "name": old_name}, set(), time.time()))
         self.assertFalse(own_new_empty_starter({**starter, "created_at": "2020-01-01T00:00:00Z"}, expected, set(), time.time()))
         self.assertFalse(own_new_empty_starter({**starter, "uploader": {"login": "other"}}, expected, set(), time.time()))
         with mock.patch(__name__ + ".release_assets", side_effect=[{}, {expected["name"]: starter}, {}, {}, {expected["name"]: asset}]), \
@@ -1176,8 +1188,8 @@ class OfflineTests(unittest.TestCase):
     def test_partial_part_upload_failure_blocks_all_small_publication_assets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            names = [f"Orvala-Mac-arm64-1.0.4.zip.part{index:02d}" for index in range(1, 8)]
-            names += [BOOTSTRAP_NAME, "macos-1.0.4-evidence.json", "macos-arm64.json"]
+            names = [f"Orvala-Mac-arm64-{VERSION}.zip.part{index:02d}" for index in range(1, 8)]
+            names += [BOOTSTRAP_NAME, EVIDENCE_NAME, "macos-arm64.json"]
             files = []
             for name in names:
                 path = root / name
@@ -1204,7 +1216,7 @@ class OfflineTests(unittest.TestCase):
 
 def run(args) -> None:
     require(sys.platform == "darwin" and platform.machine() == "arm64", "--run requires a native Apple Silicon macOS runner.")
-    require(args.confirm_version == VERSION, "--run requires --confirm-version 1.0.4.")
+    require(args.confirm_version == VERSION, f"--run requires --confirm-version {VERSION}.")
     require(os.environ.get("GITHUB_REPOSITORY", "").lower() == REPOSITORY.lower(), "Run only inside the own release repository.")
     # Remove credentials from the inherited environment before launching any child.
     credentials = {name: os.environ.pop(name, "") for name in SECRET_NAMES}
@@ -1221,7 +1233,8 @@ def run(args) -> None:
     work.mkdir(mode=0o700, parents=True)
     private_write(work / ".orvala-cloud-owned", VERSION.encode())
     output.mkdir(parents=True)
-    evidence = {"version": VERSION, "repository": REPOSITORY, "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    evidence = {"version": VERSION, "bootstrap_launcher_version": BOOTSTRAP_VERSION,
+                "repository": REPOSITORY, "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "native_game_executed": False, "private_game_sources_published": False, "portal_promoted": False,
                 "status": "in_progress"}
     try:
@@ -1230,7 +1243,9 @@ def run(args) -> None:
         download(BOOTSTRAP_URL, bootstrap_zip, BOOTSTRAP_SIZE, BOOTSTRAP_SHA256)
         bootstrap = extract_bootstrap(bootstrap_zip, work / "bootstrap")
         trust(bootstrap, prefix="bootstrap_trust", evidence=evidence)
-        evidence["bootstrap"] = {"sha256": BOOTSTRAP_SHA256, "size": BOOTSTRAP_SIZE}
+        evidence["bootstrap"] = {"launcher_version": BOOTSTRAP_VERSION, "source_url": BOOTSTRAP_URL,
+                                  "sha256": BOOTSTRAP_SHA256, "size": BOOTSTRAP_SIZE,
+                                  "approved_signed_notarized_bytes_reused": True}
         validator = bootstrap / "Contents/Resources/validate.js"
         print("Verifying and streaming the seven public frozen game parts.", flush=True)
         app = unpack_game(work, validator, evidence)
@@ -1269,7 +1284,7 @@ def run(args) -> None:
         bootstrap_asset = output / BOOTSTRAP_NAME
         shutil.copyfile(bootstrap_zip, bootstrap_asset)
         evidence["status"] = "accepted_signed_stapled_and_validated"
-        evidence_path = output / "macos-1.0.4-evidence.json"
+        evidence_path = output / EVIDENCE_NAME
         write_json(evidence_path, evidence)
         if args.publish:
             files = [output / part["name"] for part in target.parts]
@@ -1298,7 +1313,7 @@ def main(argv=None) -> int:
     mode.add_argument("--self-test", action="store_true", help="Run small offline fixtures; no network or credentials.")
     mode.add_argument("--run", action="store_true", help="Explicitly download, sign and submit to Apple on native macOS.")
     mode.add_argument("--cleanup", action="store_true", help="Remove only a marked private workspace and its temporary keychain.")
-    parser.add_argument("--publish", action="store_true", help="With --run, publish own v1.0.4 pre-release using GITHUB_TOKEN.")
+    parser.add_argument("--publish", action="store_true", help=f"With --run, publish own v{VERSION} pre-release using GITHUB_TOKEN.")
     parser.add_argument("--confirm-version", default="", help="Required explicit target version for --run.")
     parser.add_argument("--work-dir", type=Path, default=Path(tempfile.gettempdir()) / "orvala-macos-104-local")
     parser.add_argument("--output-dir", type=Path, default=Path.cwd() / "orvala-macos-104-output")
