@@ -579,7 +579,7 @@ def notarize(app: Path, work: Path, api_raw: str, evidence: dict, progress_path:
     print("Uploading notarization ZIP to Apple (separate upload timeout: 600s).", flush=True)
     upload_started = time.monotonic()
     result = command(["/usr/bin/xcrun", "notarytool", "submit", str(archive), *auth,
-                      "--no-wait", "--output-format", "json"],
+                      "--output-format", "json"],
                      "Apple notarization upload", timeout=600, check=False)
     try:
         response = json.loads(result.stdout)
@@ -1163,7 +1163,6 @@ class OfflineTests(unittest.TestCase):
             submission_id = "00000000-0000-4000-8000-000000000001"
             def fake_command(args, label, **kwargs):
                 if "submit" in args:
-                    self.assertIn("--no-wait", args)
                     self.assertNotIn("--wait", args)
                     self.assertEqual(kwargs["timeout"], 600)
                     return subprocess.CompletedProcess(args, 0, json.dumps({"id": submission_id}).encode(), b"")
