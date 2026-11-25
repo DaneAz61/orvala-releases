@@ -50,9 +50,6 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
-    env:
-      ORVALA_WORK_DIR: ${{ runner.temp }}/orvala-macos-104-${{ github.run_id }}-${{ github.run_attempt }}
-      ORVALA_OUTPUT_DIR: ${{ runner.temp }}/orvala-macos-104-output-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out only generic distribution orchestration
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -60,6 +57,12 @@ jobs:
           persist-credentials: false
           sparse-checkout: deployment/build-macos/cloud_release.py
           sparse-checkout-cone-mode: false
+      - name: Prepare disposable runtime paths before loading Apple secrets
+        run: |
+          {
+            echo "ORVALA_WORK_DIR=$RUNNER_TEMP/orvala-macos-104-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "ORVALA_OUTPUT_DIR=$RUNNER_TEMP/orvala-macos-104-output-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_ENV"
       - name: Check generic orchestration before loading Apple secrets
         run: |
           python3 deployment/build-macos/cloud_release.py --self-test
