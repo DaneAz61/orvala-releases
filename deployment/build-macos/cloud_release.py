@@ -91,6 +91,12 @@ BOOT_FAILURE_PATTERN = re.compile(
     r"(?:unable to find|failed to (?:load|initialize|open)|could not (?:load|find))"
     r"[^\n]{0,180}(?:\.NET|assembl(?:y|ies)|hostfxr|coreclr)", re.IGNORECASE,
 )
+GENERATED_FILES = (
+    "generated-private.pem", "generated-password.txt", "generated-identity.p12",
+    "generated-csr-public.pem", "generated-certificate-public.pem",
+    "generated-certificate.pem", "generated-intermediate.pem", "generated-intermediate.cer",
+)
+GENERATED_APPROVAL_OPERATION = "issue-additional-developer-id-application"
 
 
 class PipelineError(RuntimeError):
@@ -418,6 +424,253 @@ def import_identity(work: Path, credentials: dict) -> tuple[Path, str]:
     return keychain, matches[0][0]
 
 
+def validate_public_csr(data: bytes) -> None:
+    require(len(data) <= 8192 and b"PRIVATE KEY" not in data and re.fullmatch(
+        rb"-----BEGIN CERTIFICATE REQUEST-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE REQUEST-----\r?\n?", data
+    ) is not None, "Only one public PKCS#10 CSR can be published; key material is forbidden.")
+
+
+def remove_generated_files(work: Path) -> None:
+    for name in GENERATED_FILES:
+        path = work / name
+        if path.exists() or path.is_symlink():
+            require(not path.is_symlink() and path.is_file(), "Unexpected generated identity file type.")
+            path.unlink()
+
+
+def make_runner_csr(work: Path) -> tuple[dict, Path]:
+    run_id, attempt = os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    require(re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is not None
+            and re.fullmatch(r"[1-9][0-9]{0,5}", attempt) is not None,
+            "Generated identity mode requires a unique hosted run ID and attempt.")
+    password = work / "generated-password.txt"
+    private_key = work / "generated-private.pem"
+    private_write(password, secrets.token_urlsafe(48).encode("ascii"))
+    private_write(private_key, b"")
+    command(["/usr/bin/openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048",
+             "-aes-256-cbc", "-pass", "file:" + str(password), "-out", str(private_key)],
+            "Generate encrypted runner-only RSA identity", timeout=90)
+    require(private_key.read_bytes().startswith(b"-----BEGIN ENCRYPTED PRIVATE KEY-----"),
+            "Runner key must remain encrypted PKCS8 PEM.")
+    private_key.chmod(0o600)
+    stem = f"Orvala-Developer-ID-{VERSION}-run-{run_id}-attempt-{attempt}"
+    csr = work / (stem + ".csr")
+    subject = f"/CN=Orvala CI {VERSION} run {run_id}-{attempt}/OU={TEAM_ID}/O=Orvala/C=BR"
+    command(["/usr/bin/openssl", "req", "-new", "-sha256", "-key", str(private_key),
+             "-passin", "file:" + str(password), "-subj", subject, "-out", str(csr)], "Generate public CSR")
+    validate_public_csr(csr.read_bytes())
+    command(["/usr/bin/openssl", "req", "-in", str(csr), "-verify", "-noout"], "Verify public CSR self-signature")
+    public = command(["/usr/bin/openssl", "req", "-in", str(csr), "-pubkey", "-noout"], "Read CSR public key").stdout
+    public_file = work / "generated-csr-public.pem"
+    private_write(public_file, public)
+    spki = command(["/usr/bin/openssl", "pkey", "-pubin", "-in", str(public_file), "-outform", "DER"],
+                   "Encode CSR public SPKI").stdout
+    deadline = datetime.fromtimestamp(time.time() + 900, timezone.utc).isoformat().replace("+00:00", "Z")
+    request = {"schema_version": 1, "operation": GENERATED_APPROVAL_OPERATION,
+               "game_version": VERSION, "team_id": TEAM_ID, "run_id": run_id, "run_attempt": attempt,
+               "csr_filename": csr.name, "csr_sha256": sha256_file(csr), "csr_spki_sha256": hashlib.sha256(spki).hexdigest(),
+               "certificate_filename": stem + ".cer", "approval_filename": stem + ".approval.json",
+               "expiresAt": deadline, "expected_certificate_uploader": REPOSITORY.split("/")[0],
+               "requires_explicit_user_approval_before_apple_create": True, "private_key_transmitted": False}
+    return request, csr
+
+
+def utc_timestamp(value: str) -> float:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        require(parsed.tzinfo is not None, "Approval/deadline timestamp must include UTC offset.")
+        return parsed.timestamp()
+    except (ValueError, TypeError, AttributeError):
+        raise PipelineError("Invalid generated identity approval timestamp.") from None
+
+
+def validate_generated_approval(approval: dict, request: dict, certificate_sha256: str,
+                                csr_created_at: str) -> None:
+    require(isinstance(approval, dict) and approval.get("approved") is True,
+            "The exact generated CSR requires explicit user approval recorded by the owner.")
+    require(set(approval) == {"schema_version", "operation", "game_version", "team_id", "run_id", "run_attempt",
+                              "csr_sha256", "certificate_sha256", "expiresAt", "approved", "approvedAt"}
+            and approval.get("schema_version") == 1, "Approval callback must contain only the public approval schema.")
+    for name in ("operation", "game_version", "team_id", "run_id", "run_attempt", "csr_sha256", "expiresAt"):
+        require(approval.get(name) == request[name], f"Generated identity approval does not match {name}.")
+    require(approval.get("certificate_sha256") == certificate_sha256,
+            "Generated identity approval references a different certificate.")
+    approved = utc_timestamp(approval.get("approvedAt"))
+    require(utc_timestamp(csr_created_at) - 2 <= approved <= time.time() + 2
+            and approved <= utc_timestamp(request["expiresAt"]) and time.time() < utc_timestamp(request["expiresAt"]),
+            "Generated identity approval is stale, predates its CSR, or missed this runner deadline.")
+
+
+def dn_fields(text: str) -> dict[str, list[str]]:
+    # RFC2253 escaping prevents a comma inside CN from masquerading as a new OU.
+    text = re.sub(r"^(?:subject|issuer)=\s*", "", text.strip())
+    fields, current, escaped = [], [], False
+    for char in text:
+        if escaped:
+            current.extend(("\\", char))
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char in ",+":
+            fields.append("".join(current)); current = []
+        else:
+            current.append(char)
+    fields.append("".join(current))
+    output = {}
+    for field in fields:
+        if "=" in field:
+            name, value = field.split("=", 1)
+            output.setdefault(name.strip(), []).append(value.strip())
+    return output
+
+
+def validate_certificate_binding(expected_spki: str, actual_spki: str, subject: str, issuer: str, details: str) -> None:
+    require(actual_spki == expected_spki, "Certificate callback public key does not match this runner CSR.")
+    sub, iss = dn_fields(subject), dn_fields(issuer)
+    require(sub.get("OU") == [TEAM_ID] and any(value.startswith("Developer ID Application:") for value in sub.get("CN", [])),
+            "Callback is not a Developer ID Application certificate for the expected team.")
+    require(iss.get("OU") == ["G2"] and iss.get("CN") == ["Developer ID Certification Authority"],
+            "Callback was not issued by the pinned Developer ID G2 intermediate.")
+    require(re.search(r"1\.2\.840\.113635\.100\.6\.1\.13(?![0-9.])", details) is not None
+            and ("Code Signing" in details or re.search(r"1\.3\.6\.1\.5\.5\.7\.3\.3(?![0-9.])", details)),
+            "Callback lacks the Apple Developer ID Application OID or code-signing EKU.")
+
+
+def validate_certificate_der(data: bytes) -> None:
+    require(256 <= len(data) <= 16384 and data[0] == 0x30, "Callback must be one bounded DER certificate.")
+    first = data[1]
+    count = first & 0x7f if first & 0x80 else 0
+    require(count <= 4 and (not first & 0x80 or count > 0), "Invalid certificate DER length.")
+    length = int.from_bytes(data[2:2 + count], "big") if count else first
+    require(2 + count + length == len(data), "Certificate callback has trailing or incomplete DER data.")
+
+
+def publish_generated_request(request: dict, csr: Path, work: Path, token: str, evidence: dict, progress: Path) -> tuple[str, str]:
+    validate_public_csr(csr.read_bytes())
+    require(csr.name == request["csr_filename"] and sha256_file(csr) == request["csr_sha256"], "Public CSR changed before upload.")
+    release = ensure_release(token, preparation_only=True)
+    endpoint = f"repos/{REPOSITORY}/releases/{release['id']}/assets"
+    baseline = {item["id"] for item in release_assets(endpoint, token).values()}
+    request_path = work / csr.with_suffix(".request.json").name
+    write_json(request_path, request)
+    # Explicit whitelist: only the self-verified CSR and public request metadata.
+    allowed = {request["csr_filename"], csr.with_suffix(".request.json").name}
+    for path in (csr, request_path):
+        require(path.name in allowed and path.suffix in (".csr", ".json"), "Private identity upload is forbidden.")
+        expected = {"name": path.name, "path": path, "size": path.stat().st_size, "sha256": sha256_file(path)}
+        upload_release_asset(expected, token, endpoint, baseline)
+    asset = release_assets(endpoint, token)[csr.name]
+    require(asset.get("uploader", {}).get("login") == "github-actions[bot]", "CSR must originate from this Actions runner.")
+    base = f"{RELEASE_ROOT}/v{VERSION}/"
+    evidence["generated_identity"] = {"mode": "awaiting_explicit_owner_approved_certificate", "request": request,
+                                      "csr_url": base + csr.name, "request_url": base + request_path.name,
+                                      "csr_asset_id": asset["id"], "private_key_transmitted": False,
+                                      "certificate_issued_by_this_code": False}
+    write_json(progress, evidence)
+    print(f"PUBLIC CSR READY: {base + csr.name}\nCSR SHA-256: {request['csr_sha256']}\n"
+          f"REQUEST: {base + request_path.name}\nCALLBACK CERTIFICATE: {base + request['certificate_filename']}\n"
+          f"CALLBACK APPROVAL: {base + request['approval_filename']}\nDEADLINE UTC: {request['expiresAt']}\n"
+          "Operator must obtain explicit user approval before creating an additional Apple certificate. No certificate is issued automatically.", flush=True)
+    return endpoint, asset["created_at"]
+
+
+def await_generated_callback(request: dict, csr_created_at: str, endpoint: str, work: Path, token: str) -> tuple[Path, dict]:
+    deadline = utc_timestamp(request["expiresAt"])
+    owner = REPOSITORY.split("/")[0].casefold()
+    while time.time() < deadline:
+        remaining = max(1, int(deadline - time.time()))
+        try:
+            assets = release_assets(endpoint, token, timeout=min(20, remaining))
+        except PipelineError:
+            assets = {}
+        selected = [assets.get(request["certificate_filename"]), assets.get(request["approval_filename"])]
+        if all(item and item.get("state") == "uploaded" for item in selected):
+            paths = []
+            download_failed = False
+            for asset, maximum in zip(selected, (16384, 8192)):
+                require(asset.get("uploader", {}).get("login", "").casefold() == owner,
+                        "Certificate and approval callbacks must both be uploaded by the repository owner.")
+                require(0 < asset.get("size", 0) <= maximum and re.fullmatch(r"sha256:[a-f0-9]{64}", asset.get("digest", "")) is not None,
+                        "Callback size/digest is invalid.")
+                require(time.time() < deadline, "Generated certificate callback deadline expired.")
+                path = work / asset["name"]
+                timeout = min(20, max(1, int(deadline - time.time())))
+                url = f"{RELEASE_ROOT}/v{VERSION}/{asset['name']}"
+                try:
+                    command(["/usr/bin/curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https",
+                             "--tlsv1.2", "--max-time", str(timeout), "--output", str(path), url],
+                            "Download exact public owner callback", timeout=timeout + 1)
+                except PipelineError:
+                    download_failed = True
+                    break  # Retry public transport within the same fixed deadline, never trust unchecked bytes.
+                verify_file(path, asset["size"], asset["digest"].split(":", 1)[1])
+                paths.append(path)
+            if download_failed:
+                time.sleep(min(5, max(0, deadline - time.time())))
+                continue
+            try:
+                approval = json.loads(paths[1].read_text(encoding="utf-8"))
+            except (ValueError, UnicodeError):
+                raise PipelineError("Invalid owner approval callback JSON.") from None
+            validate_generated_approval(approval, request, sha256_file(paths[0]), csr_created_at)
+            return paths[0], approval
+        time.sleep(min(5, max(0, deadline - time.time())))
+    raise PipelineError("Generated identity callback timed out after its 15-minute deadline; no game will be signed or published.")
+
+
+def acquire_generated_identity(work: Path, token: str, evidence: dict, progress: Path) -> tuple[Path, str]:
+    local_credentials = {}
+    try:
+        request, csr = make_runner_csr(work)
+        endpoint, csr_created = publish_generated_request(request, csr, work, token, evidence, progress)
+        certificate, approval = await_generated_callback(request, csr_created, endpoint, work, token)
+        validate_certificate_der(certificate.read_bytes())
+        # Public certificate only: extract SPKI and compare it to the CSR before
+        # any key/certificate import, then validate Apple policy and native trust.
+        public = command(["/usr/bin/openssl", "x509", "-inform", "DER", "-in", str(certificate), "-pubkey", "-noout"],
+                         "Read callback public key").stdout
+        public_path = work / "generated-certificate-public.pem"
+        private_write(public_path, public)
+        spki = command(["/usr/bin/openssl", "pkey", "-pubin", "-in", str(public_path), "-outform", "DER"],
+                       "Encode callback public SPKI").stdout
+        description = command(["/usr/bin/openssl", "x509", "-inform", "DER", "-in", str(certificate),
+                               "-noout", "-subject", "-issuer", "-nameopt", "RFC2253", "-text"], "Inspect public callback certificate").stdout.decode("utf-8", "replace")
+        subject = next((line for line in description.splitlines() if line.startswith("subject=")), "")
+        issuer = next((line for line in description.splitlines() if line.startswith("issuer=")), "")
+        validate_certificate_binding(request["csr_spki_sha256"], hashlib.sha256(spki).hexdigest(), subject, issuer, description)
+        intermediate = work / "generated-intermediate.cer"
+        download(DEVELOPER_ID_CA_URL, intermediate, DEVELOPER_ID_CA_SIZE, DEVELOPER_ID_CA_SHA256)
+        command(["/usr/bin/security", "verify-cert", "-c", str(certificate), "-c", str(intermediate), "-p", "codeSign"],
+                "Validate generated Developer ID certificate against Apple G2 and system trust")
+        leaf_pem, ca_pem = work / "generated-certificate.pem", work / "generated-intermediate.pem"
+        for source, target in ((certificate, leaf_pem), (intermediate, ca_pem)):
+            private_write(target, b"")
+            command(["/usr/bin/openssl", "x509", "-inform", "DER", "-in", str(source), "-out", str(target)],
+                    "Convert public certificate for native identity import")
+        password_file, key = work / "generated-password.txt", work / "generated-private.pem"
+        p12 = work / "generated-identity.p12"
+        private_write(p12, b"")
+        # Local PKCS12 is only an interoperability container for security import.
+        # Neither it nor the encrypted key/password ever leaves this runner.
+        command(["/usr/bin/openssl", "pkcs12", "-export", "-inkey", str(key), "-passin", "file:" + str(password_file),
+                 "-in", str(leaf_pem), "-certfile", str(ca_pem), "-out", str(p12), "-passout", "file:" + str(password_file),
+                 "-keypbe", "PBE-SHA1-3DES", "-certpbe", "PBE-SHA1-3DES", "-macalg", "sha1"],
+                "Package generated identity locally for isolated native import")
+        local_credentials = {SECRET_NAMES[0]: base64.b64encode(p12.read_bytes()).decode("ascii"),
+                             SECRET_NAMES[1]: password_file.read_text(encoding="ascii")}
+        keychain, identity = import_identity(work, local_credentials)
+        evidence["generated_identity"].update(mode="owner_approved_callback_validated", certificate_sha256=sha256_file(certificate),
+                                              csr_spki_sha256=request["csr_spki_sha256"], team_id=TEAM_ID,
+                                              intermediate_sha256=DEVELOPER_ID_CA_SHA256,
+                                              approval_reference=approval, public_key_match=True,
+                                              developer_id_application_oid_verified=True, original_identity_unchanged=True)
+        write_json(progress, evidence)
+        return keychain, identity
+    finally:
+        local_credentials.clear()
+        remove_generated_files(work)
+
+
 def verify_signed_chain(description: str) -> list[str]:
     require(f"TeamIdentifier={TEAM_ID}" in description and "runtime" in description,
             "Signed bundle has an unexpected team or no hardened runtime.")
@@ -628,10 +881,14 @@ def remove_signing_material(work: Path, evidence: dict) -> None:
     require(not any(work.glob("signing.keychain*")), "Signing keychain still exists; game execution is blocked.")
     require(not (work / "identity.p12").exists() and not (work / "notary-key.p8").exists(),
             "Signing material still exists; game execution is blocked.")
+    require(not any((work / name).exists() for name in GENERATED_FILES),
+            "Generated key/password/container material still exists; game execution is blocked.")
     require(not any(name in os.environ for name in (*SECRET_NAMES, "GH_TOKEN", "GITHUB_TOKEN")),
             "Signing or release credentials remain in the process environment.")
     evidence["signing_material_removed_before_game_execution"] = True
     evidence["user_keychain_search_list_restored_before_game_execution"] = True
+    if "generated_identity" in evidence:
+        evidence["generated_identity"]["private_key_material_deleted_before_game"] = True
 
 
 def smoke_passed(exit_code: int, log: str) -> bool:
@@ -725,9 +982,9 @@ def verify_final_roundtrip(app: Path, output: Path, work: Path, validator: Path,
     return verified_app
 
 
-def gh_json(args: list[str], token: str, *, allow_missing: bool = False) -> object | None:
+def gh_json(args: list[str], token: str, *, allow_missing: bool = False, timeout: int = 300) -> object | None:
     env = dict(os.environ, GH_TOKEN=token, GH_PROMPT_DISABLED="1")
-    result = command(["gh", *args], "Own repository release API", env=env, check=False, timeout=300)
+    result = command(["gh", *args], "Own repository release API", env=env, check=False, timeout=timeout)
     if result.returncode:
         if allow_missing and b"HTTP 404" in result.stderr:
             return None
@@ -738,14 +995,15 @@ def gh_json(args: list[str], token: str, *, allow_missing: bool = False) -> obje
         raise PipelineError("Own repository release API returned invalid JSON.") from None
 
 
-def ensure_release(token: str) -> dict:
+def ensure_release(token: str, *, preparation_only: bool = False) -> dict:
     endpoint = f"repos/{REPOSITORY}/releases"
     existing = gh_json(["api", f"{endpoint}/tags/v{VERSION}"], token, allow_missing=True)
     if existing is None:
         existing = gh_json([
             "api", "--method", "POST", endpoint, "-f", f"tag_name=v{VERSION}",
             "-f", f"name=Orvala Mac {VERSION} — validação", "-f", "make_latest=false", "-F", "prerelease=true",
-            "-f", "body=Mac Apple Silicon, macOS 13+. Pacote assinado e notarizado. Canal em validação; sem promoção do portal."
+            "-f", ("body=Preparação do Orvala Mac: CSR público aguardando aprovação e emissão manual. Jogo ainda não validado; portal não promovido."
+                    if preparation_only else "body=Mac Apple Silicon, macOS 13+. Pacote assinado e notarizado. Canal em validação; sem promoção do portal.")
         ], token)
     require(isinstance(existing, dict) and existing.get("tag_name") == f"v{VERSION}"
             and existing.get("prerelease") is True and existing.get("draft") is False,
@@ -756,8 +1014,8 @@ def ensure_release(token: str) -> dict:
     return existing
 
 
-def release_assets(endpoint: str, token: str) -> dict[str, dict]:
-    pages = gh_json(["api", "--paginate", "--slurp", endpoint], token)
+def release_assets(endpoint: str, token: str, *, timeout: int = 300) -> dict[str, dict]:
+    pages = gh_json(["api", "--paginate", "--slurp", endpoint], token, timeout=timeout)
     require(isinstance(pages, list) and all(isinstance(page, list) for page in pages),
             "Unexpected release assets response.")
     items = [item for page in pages for item in page]
@@ -944,10 +1202,10 @@ def cleanup(work: Path) -> None:
         raise restore_error
 
 
-def plan() -> dict:
+def plan(generate_identity: bool = False) -> dict:
     return {
         "mode": "offline plan; no network, credentials or external changes", "repository": REPOSITORY,
-        "runner": "standard public macos-15 / Apple Silicon", "timeout_minutes": 40,
+        "runner": "standard public macos-15 / Apple Silicon", "timeout_minutes": 60 if generate_identity else 40,
         "target_version": VERSION, "minimum_macos": MINIMUM_MACOS,
         "base": base_manifest(),
         "bootstrap_launcher_version": BOOTSTRAP_VERSION,
@@ -956,7 +1214,21 @@ def plan() -> dict:
                       "approved_signed_notarized_bytes_reused": True},
         "public_intermediate": {"url": DEVELOPER_ID_CA_URL, "size": DEVELOPER_ID_CA_SIZE,
                                 "sha256": DEVELOPER_ID_CA_SHA256},
-        "pck": {"size": PCK_SIZE, "sha256": PCK_SHA256}, "temporary_secret_names": list(SECRET_NAMES),
+        "pck": {"size": PCK_SIZE, "sha256": PCK_SHA256},
+        "temporary_secret_names": [SECRET_NAMES[2]] if generate_identity else list(SECRET_NAMES),
+        "identity_mode": "explicit runner-generated CSR with owner approval callback" if generate_identity else "existing PKCS12 secret (default)",
+        "generated_identity_contract": {
+            "opt_in_only": "--run --publish --generate-identity --confirm-version 1.0.5",
+            "rsa_bits": 2048, "encrypted_private_key_mode": "0600; AES256; never transmitted",
+            "public_assets": ["<run-specific-stem>.csr", "<run-specific-stem>.request.json"],
+            "owner_callbacks": ["<same-stem>.cer", "<same-stem>.approval.json"],
+            "owner": REPOSITORY.split("/")[0], "csr_uploader": "github-actions[bot]",
+            "callback_wait_minutes": 15, "certificate_issued_by_code": False,
+            "approval_fields": ["schema_version", "operation", "game_version", "team_id", "run_id", "run_attempt",
+                                "csr_sha256", "certificate_sha256", "expiresAt", "approved", "approvedAt"],
+            "certificate_gates": "exact CSR SPKI, Developer ID Application OID/EKU, team, pinned G2, native Apple trust",
+            "original_identity_read_or_revoked": False,
+        },
         "steps": ["Verify public bootstrap hash and native Apple trust checks",
                   "Download seven frozen public base parts; verify individual and virtual ZIP hashes",
                   "Run approved bootstrap JXA, native tar streaming, restore and verify Unix permissions",
@@ -1212,6 +1484,142 @@ class OfflineTests(unittest.TestCase):
             progress = json.loads((root / "progress.json").read_text())
             self.assertFalse(progress["publication_progress"]["manifest_published"])
 
+    def test_generated_csr_publication_rejects_private_key_material_before_any_upload(self):
+        public = b"-----BEGIN CERTIFICATE REQUEST-----\nZmFrZS1wdWJsaWMtY3Ny\n-----END CERTIFICATE REQUEST-----\n"
+        validate_public_csr(public)
+        for forbidden in (b"-----BEGIN ENCRYPTED PRIVATE KEY-----\nfixture\n-----END ENCRYPTED PRIVATE KEY-----\n",
+                          public + b"-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n"):
+            with tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                csr = work / "fixture.csr"
+                csr.write_bytes(forbidden)
+                with mock.patch(__name__ + ".ensure_release") as remote:
+                    with self.assertRaises(PipelineError):
+                        publish_generated_request({}, csr, work, "fixture-token", {}, work / "progress.json")
+                remote.assert_not_called()
+
+    def test_generated_certificate_requires_same_spki_team_application_oid_and_g2(self):
+        expected = "a" * 64
+        subject = "subject=CN=Developer ID Application: Fixture,OU=WN9MP7LBRW,O=Fixture"
+        issuer = "issuer=CN=Developer ID Certification Authority,OU=G2,O=Apple Inc."
+        details = "X509v3 Extended Key Usage: Code Signing\n1.2.840.113635.100.6.1.13: critical\n"
+        validate_certificate_binding(expected, expected, subject, issuer, details)
+        invalid = [("b" * 64, subject, issuer, details),
+                   (expected, subject.replace("WN9MP7LBRW", "OTHERTEAM1"), issuer, details),
+                   (expected, "subject=CN=Fixture\\,OU=WN9MP7LBRW,OU=OTHERTEAM1", issuer, details),
+                   (expected, subject, issuer.replace("G2", "G1"), details),
+                   (expected, subject, issuer, details.replace(".1.13", ".1.14")),
+                   (expected, subject, issuer, details.replace("Code Signing", "Server Authentication"))]
+        for actual, sub, iss, text in invalid:
+            with self.assertRaises(PipelineError):
+                validate_certificate_binding(expected, actual, sub, iss, text)
+        certificate = b"\x30\x82\x01\x00" + b"\x00" * 256
+        validate_certificate_der(certificate)
+        with self.assertRaises(PipelineError):
+            validate_certificate_der(certificate + b"trailing-private-data")
+
+    def test_generated_approval_binds_owner_record_to_exact_run_csr_cert_and_live_deadline(self):
+        now = time.time()
+        iso = lambda stamp: datetime.fromtimestamp(stamp, timezone.utc).isoformat().replace("+00:00", "Z")
+        request = {"operation": GENERATED_APPROVAL_OPERATION, "game_version": VERSION, "team_id": TEAM_ID,
+                   "run_id": "12345", "run_attempt": "1", "csr_sha256": "a" * 64, "expiresAt": iso(now + 900)}
+        approval = {"schema_version": 1, **request, "approved": True, "approvedAt": iso(now), "certificate_sha256": "b" * 64}
+        validate_generated_approval(approval, request, "b" * 64, iso(now - 3))
+        for changed in ({**approval, "run_id": "99999"}, {**approval, "csr_sha256": "c" * 64},
+                        {**approval, "certificate_sha256": "c" * 64}, {**approval, "approved": False},
+                        {**approval, "approvedAt": iso(now - 100)}, {**approval, "private_key": "forbidden"}):
+            with self.assertRaises(PipelineError):
+                validate_generated_approval(changed, request, "b" * 64, iso(now - 3))
+
+    def test_generated_callback_timeout_erases_local_material_and_never_imports_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            keep = work / "unrelated-fixture.bin"
+            keep.write_bytes(b"keep")
+            for name in GENERATED_FILES:
+                (work / name).write_bytes(b"fake-disposable-material")
+            csr = work / "fixture.csr"
+            csr.write_bytes(b"public fixture")
+            with mock.patch(__name__ + ".make_runner_csr", return_value=({}, csr)), \
+                 mock.patch(__name__ + ".publish_generated_request", return_value=("endpoint", "2026-11-25T00:00:00Z")), \
+                 mock.patch(__name__ + ".await_generated_callback", side_effect=PipelineError("fixture callback timeout")), \
+                 mock.patch(__name__ + ".import_identity") as importer:
+                with self.assertRaises(PipelineError):
+                    acquire_generated_identity(work, "fixture-token", {}, work / "progress.json")
+            importer.assert_not_called()
+            self.assertTrue(keep.is_file())
+            self.assertFalse(any((work / name).exists() for name in GENERATED_FILES))
+            expired = {"expiresAt": "2020-01-01T00:00:00Z"}
+            with mock.patch(__name__ + ".release_assets") as remote:
+                with self.assertRaises(PipelineError):
+                    await_generated_callback(expired, "2020-01-01T00:00:00Z", "endpoint", work, "fixture-token")
+            remote.assert_not_called()
+
+    def test_generated_identity_is_explicit_and_keeps_default_pkcs12_contract(self):
+        regular, generated = plan(), plan(True)
+        self.assertEqual(regular["temporary_secret_names"], list(SECRET_NAMES))
+        self.assertEqual(regular["timeout_minutes"], 40)
+        self.assertEqual(generated["temporary_secret_names"], ["APPLE_NOTARY_API_JSON"])
+        self.assertEqual(generated["timeout_minutes"], 60)
+        self.assertFalse(generated["generated_identity_contract"]["certificate_issued_by_code"])
+
+    def test_generated_callback_transient_download_reuses_same_request_and_honors_deadline(self):
+        for expires_during_retry in (False, True):
+            with self.subTest(expires_during_retry=expires_during_retry), tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                started = time.time()
+                clock = [started]
+                iso = lambda stamp: datetime.fromtimestamp(stamp, timezone.utc).isoformat().replace("+00:00", "Z")
+                stem = f"Orvala-Developer-ID-{VERSION}-run-12345-attempt-1"
+                request = {"operation": GENERATED_APPROVAL_OPERATION, "game_version": VERSION, "team_id": TEAM_ID,
+                           "run_id": "12345", "run_attempt": "1", "csr_sha256": "a" * 64,
+                           "expiresAt": iso(started + 60), "certificate_filename": stem + ".cer",
+                           "approval_filename": stem + ".approval.json"}
+                certificate_bytes = b"\x30\x82\x01\x00" + b"\x00" * 256
+                approval = {"schema_version": 1,
+                            **{key: request[key] for key in ("operation", "game_version", "team_id", "run_id", "run_attempt", "csr_sha256", "expiresAt")},
+                            "certificate_sha256": hashlib.sha256(certificate_bytes).hexdigest(),
+                            "approved": True, "approvedAt": iso(started)}
+                payloads = {request["certificate_filename"]: certificate_bytes,
+                            request["approval_filename"]: json.dumps(approval).encode("utf-8")}
+                assets = {name: {"id": index, "name": name, "state": "uploaded", "size": len(data),
+                                  "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+                                  "uploader": {"login": REPOSITORY.split("/")[0]}}
+                          for index, (name, data) in enumerate(payloads.items(), 1)}
+                attempts = []
+                def fake_download(args, label, **kwargs):
+                    self.assertEqual(args[0], "/usr/bin/curl")
+                    attempts.append(args[-1])
+                    if len(attempts) == 1:
+                        raise PipelineError("fixture public callback HTTP 502/404")
+                    target = Path(args[args.index("--output") + 1])
+                    target.write_bytes(payloads[target.name])
+                    return subprocess.CompletedProcess(args, 0, b"", b"")
+                def fake_sleep(seconds):
+                    clock[0] += 61 if expires_during_retry else seconds
+                with mock.patch(__name__ + ".time.time", side_effect=lambda: clock[0]), \
+                     mock.patch(__name__ + ".time.sleep", side_effect=fake_sleep), \
+                     mock.patch(__name__ + ".release_assets", return_value=assets) as metadata, \
+                     mock.patch(__name__ + ".command", side_effect=fake_download), \
+                     mock.patch(__name__ + ".make_runner_csr") as key_generation, \
+                     mock.patch(__name__ + ".publish_generated_request") as csr_upload, \
+                     mock.patch(__name__ + ".import_identity") as key_import:
+                    if expires_during_retry:
+                        with self.assertRaises(PipelineError):
+                            await_generated_callback(request, iso(started - 3), "fixture-endpoint", work, "fixture-token")
+                        self.assertEqual(metadata.call_count, 1)
+                        self.assertEqual(len(attempts), 1)
+                    else:
+                        certificate, approved = await_generated_callback(request, iso(started - 3), "fixture-endpoint", work, "fixture-token")
+                        self.assertEqual(certificate.read_bytes(), certificate_bytes)
+                        self.assertEqual(approved, approval)
+                        self.assertEqual(metadata.call_count, 2)
+                        self.assertEqual(len(attempts), 3)
+                        self.assertEqual(clock[0], started + 5)
+                    key_generation.assert_not_called()
+                    csr_upload.assert_not_called()
+                    key_import.assert_not_called()
+
 
 def run(args) -> None:
     require(sys.platform == "darwin" and platform.machine() == "arm64", "--run requires a native Apple Silicon macOS runner.")
@@ -1222,7 +1630,9 @@ def run(args) -> None:
     gh_token, github_token = os.environ.pop("GH_TOKEN", ""), os.environ.pop("GITHUB_TOKEN", "")
     token = gh_token or github_token
     del gh_token, github_token
-    require(all(credentials.values()), "All three temporary Apple signing secrets are required.")
+    require(bool(credentials[SECRET_NAMES[2]]) if args.generate_identity else all(credentials.values()),
+            "Generated identity mode requires only the authorized notary JSON; regular mode requires all three signing secrets.")
+    require(not args.generate_identity or args.publish, "--generate-identity requires explicit --publish for its public CSR handshake.")
     require(not args.publish or bool(token), "Publication requires the built-in own repository GITHUB_TOKEN.")
     work, output = args.work_dir.resolve(), args.output_dir.resolve()
     require(work.name.startswith("orvala-macos-104-") and not work.exists(), "Use a new exclusive orvala-macos-104-* workspace.")
@@ -1248,7 +1658,11 @@ def run(args) -> None:
         validator = bootstrap / "Contents/Resources/validate.js"
         print("Verifying and streaming the seven public frozen game parts.", flush=True)
         app = unpack_game(work, validator, evidence)
-        keychain, identity = import_identity(work, credentials)
+        if args.generate_identity:
+            print("Explicit generated identity mode: publishing only a public CSR; awaiting owner-approved Apple certificate callback.", flush=True)
+            keychain, identity = acquire_generated_identity(work, token, evidence, output / "run-result.json")
+        else:
+            keychain, identity = import_identity(work, credentials)
         print("Signing frozen native code with Developer ID in a temporary keychain.", flush=True)
         sign_game(app, work, keychain, identity, evidence)
         notarize(app, work, credentials[SECRET_NAMES[2]], evidence, output / "run-result.json")
@@ -1313,6 +1727,8 @@ def main(argv=None) -> int:
     mode.add_argument("--run", action="store_true", help="Explicitly download, sign and submit to Apple on native macOS.")
     mode.add_argument("--cleanup", action="store_true", help="Remove only a marked private workspace and its temporary keychain.")
     parser.add_argument("--publish", action="store_true", help=f"With --run, publish own v{VERSION} pre-release using GITHUB_TOKEN.")
+    parser.add_argument("--generate-identity", action="store_true",
+                        help="Explicit alternative: runner-only encrypted RSA key and public CSR; owner-approved certificate/approval callbacks required. Never a fallback.")
     parser.add_argument("--confirm-version", default="", help="Required explicit target version for --run.")
     parser.add_argument("--work-dir", type=Path, default=Path(tempfile.gettempdir()) / "orvala-macos-104-local")
     parser.add_argument("--output-dir", type=Path, default=Path.cwd() / "orvala-macos-104-output")
@@ -1327,7 +1743,7 @@ def main(argv=None) -> int:
         elif args.run:
             run(args)
         else:
-            print(json.dumps(plan(), indent=2, ensure_ascii=False))
+            print(json.dumps(plan(args.generate_identity), indent=2, ensure_ascii=False))
         return 0
     except PipelineError as error:
         print(f"ERROR: {error}", file=sys.stderr)
