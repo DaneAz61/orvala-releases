@@ -24,6 +24,7 @@ import platform
 import plistlib
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -134,15 +135,30 @@ def base_manifest() -> dict:
     }
 
 
+def safe_codesign_stderr(data: bytes) -> str:
+    text = data.decode("utf-8", "replace")
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"-----BEGIN [^-\n]+-----.*?-----END [^-\n]+-----", "[REDACTED KEY BLOCK]", text,
+                  flags=re.DOTALL)
+    text = "".join(char for char in text if char in "\n\t" or ord(char) >= 32)
+    return text[-8192:].strip()
+
+
 def command(argv: list[str], label: str, *, timeout: int = 180,
-            env: dict | None = None, check: bool = True) -> subprocess.CompletedProcess:
+            env: dict | None = None, check: bool = True,
+            codesign_diagnostics: bool = False, cwd: Path | None = None) -> subprocess.CompletedProcess:
     # Never print argv: security import contains a password in an OS CLI argument.
     try:
         result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                timeout=timeout, env=env, check=False)
+                                timeout=timeout, env=env, check=False, cwd=cwd)
     except (OSError, subprocess.TimeoutExpired):
         raise PipelineError(f"{label} could not finish within {timeout} seconds.") from None
     if check and result.returncode:
+        # Opt-in ONLY for codesign, whose arguments contain identity hashes/paths,
+        # never a password or API key. security/notarytool output stays private.
+        if codesign_diagnostics and argv[0] == "/usr/bin/codesign":
+            diagnostic = safe_codesign_stderr(result.stderr)
+            print(f"CODESIGN FAILURE: {label}\n{diagnostic or '(no codesign stderr)'}", file=sys.stderr, flush=True)
         raise PipelineError(f"{label} failed (exit {result.returncode}); no release was promoted.")
     return result
 
@@ -311,6 +327,57 @@ def is_macho(path: Path) -> bool:
         return source.read(4) in MACHO_MAGICS
 
 
+def user_keychain_search_list() -> list[str]:
+    result = command(["/usr/bin/security", "list-keychains", "-d", "user"], "Read existing user keychain search list")
+    try:
+        paths = shlex.split(result.stdout.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise PipelineError("Could not parse the existing user keychain search list.") from None
+    require(all(Path(path).is_absolute() and "\n" not in path and "\x00" not in path for path in paths),
+            "Unexpected user keychain search list entry.")
+    return paths
+
+
+def merged_keychain_list(original: list[str], current: list[str], temporary: str,
+                         *, include_temporary: bool) -> list[str]:
+    # Keep every pre-existing keychain, plus unrelated additions made since the
+    # snapshot. Scope our only change to this job's own temporary keychain.
+    paths = [path for path in [*original, *current] if path != temporary]
+    if include_temporary:
+        paths.append(temporary)
+    return list(dict.fromkeys(paths))
+
+
+def remember_user_keychain_search_list(work: Path) -> None:
+    private_write(work / "keychain-search-list.json", json.dumps(user_keychain_search_list()).encode("utf-8"))
+
+
+def register_temp_keychain(work: Path, keychain: Path) -> None:
+    original = json.loads((work / "keychain-search-list.json").read_text(encoding="utf-8"))
+    paths = merged_keychain_list(original, user_keychain_search_list(), str(keychain), include_temporary=True)
+    command(["/usr/bin/security", "list-keychains", "-d", "user", "-s", *paths],
+            "Register temporary keychain without replacing existing keychains")
+    registered = user_keychain_search_list()
+    require(all(path in registered for path in paths), "Temporary keychain registration was incomplete.")
+
+
+def restore_user_keychain_search_list(work: Path) -> None:
+    snapshot = work / "keychain-search-list.json"
+    if not snapshot.exists():
+        return
+    original = json.loads(snapshot.read_text(encoding="utf-8"))
+    require(isinstance(original, list) and all(isinstance(path, str) for path in original),
+            "Saved keychain search list is invalid.")
+    keychain = str(work / "signing.keychain-db")
+    paths = merged_keychain_list(original, user_keychain_search_list(), keychain, include_temporary=False)
+    command(["/usr/bin/security", "list-keychains", "-d", "user", "-s", *paths],
+            "Restore user keychain search list before deleting temporary identity")
+    current = user_keychain_search_list()
+    require(keychain not in current and all(path in current for path in paths),
+            "User keychain search list was not restored.")
+    snapshot.unlink()
+
+
 def import_identity(work: Path, credentials: dict) -> tuple[Path, str]:
     try:
         p12 = base64.b64decode(credentials[SECRET_NAMES[0]], validate=True)
@@ -321,9 +388,13 @@ def import_identity(work: Path, credentials: dict) -> tuple[Path, str]:
     private_write(p12_path, p12)
     keychain = work / "signing.keychain-db"
     password = secrets.token_urlsafe(36)
+    remember_user_keychain_search_list(work)
     command(["/usr/bin/security", "create-keychain", "-p", password, str(keychain)], "Temporary keychain creation")
     command(["/usr/bin/security", "set-keychain-settings", "-lut", "1200", str(keychain)], "Temporary keychain settings")
     command(["/usr/bin/security", "unlock-keychain", "-p", password, str(keychain)], "Temporary keychain unlock")
+    # GitHub's official macOS signing setup registers the keychain for codesign's
+    # chain/key resolution. Preserve all original keychains instead of replacing.
+    register_temp_keychain(work, keychain)
     # The approved PKCS12 is leaf-only. Supply its public intermediate explicitly;
     # use the ordinary Apple system root, without adding any custom trust setting.
     intermediate = work / "DeveloperIDG2CA.cer"
@@ -348,9 +419,9 @@ def verify_signed_chain(description: str) -> list[str]:
             "Signed bundle has an unexpected team or no hardened runtime.")
     authorities = re.findall(r"^Authority=(.+)$", description, flags=re.MULTILINE)
     require(len(authorities) >= 3 and authorities[0].startswith("Developer ID Application:")
-            and authorities[1] == "Developer ID Certification Authority G2"
+            and authorities[1] == "Developer ID Certification Authority"
             and authorities[-1] == "Apple Root CA",
-            "Signed bundle does not contain the expected Developer ID G2 to Apple root chain.")
+            "Signed bundle does not contain the expected Developer ID to Apple root chain.")
     return authorities
 
 
@@ -374,14 +445,22 @@ def sign_game(app: Path, work: Path, keychain: Path, identity: str, evidence: di
         # Every executable may host .NET; shared libraries need no host entitlements.
         if path == main or path.name == "createdump":
             args += ["--entitlements", str(entitlements)]
-        command(args + [str(path)], "Native code signature", timeout=90)
+        command(args + [str(path)], f"Native code signature ({path.relative_to(app).as_posix()})",
+                timeout=90, codesign_diagnostics=True)
     command(["/usr/bin/codesign", "--force", "--sign", identity, "--keychain", str(keychain),
              "--options", "runtime", "--timestamp", "--entitlements", str(entitlements), str(app)],
-            "Main application signature", timeout=180)
+            "Main application signature (Orvala.app)", timeout=180, codesign_diagnostics=True)
     command(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], "Complete signature verification")
     description = command(["/usr/bin/codesign", "--display", "--verbose=4", str(app)],
                           "Signed application identity").stderr.decode("utf-8", "replace")
     authorities = verify_signed_chain(description)
+    # G2 lives in the intermediate's OU, NOT its CN. Verify the actual embedded
+    # certificate bytes rather than inventing a suffix in codesign's Authority.
+    certificates = work / "signed-certificate-chain"
+    certificates.mkdir()
+    command(["/usr/bin/codesign", "--display", "--extract-certificates", str(app)],
+            "Extract signed public certificate chain", cwd=certificates)
+    verify_file(certificates / "codesign1", DEVELOPER_ID_CA_SIZE, DEVELOPER_ID_CA_SHA256)
     actual_entitlements = command(["/usr/bin/codesign", "--display", "--entitlements", ":-", str(app)],
                                   "Signed JIT entitlements").stdout
     require(plistlib.loads(actual_entitlements) == JIT_ENTITLEMENTS, "Signed JIT entitlements do not match the approved four.")
@@ -391,7 +470,8 @@ def sign_game(app: Path, work: Path, keychain: Path, identity: str, evidence: di
                            "jit_entitlements": JIT_ENTITLEMENTS, "managed_assemblies_unchanged": len(before_dlls),
                            "pck_unchanged": True, "minimum_macos": MINIMUM_MACOS,
                            "certificate_chain": authorities,
-                           "public_intermediate_sha256": DEVELOPER_ID_CA_SHA256}
+                           "public_intermediate_sha256": DEVELOPER_ID_CA_SHA256,
+                           "embedded_signed_intermediate_sha256_verified": True}
 
 
 class MultipartWriter(io.RawIOBase):
@@ -512,6 +592,7 @@ def notarize(app: Path, work: Path, api_raw: str, evidence: dict) -> None:
 
 
 def remove_signing_material(work: Path, evidence: dict) -> None:
+    restore_user_keychain_search_list(work)
     keychain = work / "signing.keychain-db"
     if keychain.exists():
         command(["/usr/bin/security", "delete-keychain", str(keychain)], "Remove signing keychain before game execution")
@@ -521,6 +602,7 @@ def remove_signing_material(work: Path, evidence: dict) -> None:
     require(not any(name in os.environ for name in (*SECRET_NAMES, "GH_TOKEN", "GITHUB_TOKEN")),
             "Signing or release credentials remain in the process environment.")
     evidence["signing_material_removed_before_game_execution"] = True
+    evidence["user_keychain_search_list_restored_before_game_execution"] = True
 
 
 def smoke_passed(exit_code: int, log: str) -> bool:
@@ -689,9 +771,22 @@ def cleanup(work: Path) -> None:
     require(not work.is_symlink() and (work / ".orvala-cloud-owned").read_text() == VERSION,
             "Private workspace ownership cannot be verified; refusing cleanup.")
     keychain = work / "signing.keychain-db"
-    if sys.platform == "darwin" and keychain.exists():
-        command(["/usr/bin/security", "delete-keychain", str(keychain)], "Temporary keychain cleanup", check=False)
+    restore_error = None
+    if sys.platform == "darwin":
+        try:
+            restore_user_keychain_search_list(work)
+        except Exception:
+            restore_error = PipelineError("User keychain search-list restoration failed during cleanup.")
+        if keychain.exists():
+            try:
+                command(["/usr/bin/security", "delete-keychain", str(keychain)], "Temporary keychain cleanup", check=False)
+            except PipelineError:
+                # Still erase the owned private directory, including the encrypted
+                # keychain file and any P12/P8 left by an earlier failed import.
+                restore_error = restore_error or PipelineError("Temporary keychain removal command failed during cleanup.")
     shutil.rmtree(work)
+    if restore_error:
+        raise restore_error
 
 
 def plan() -> dict:
@@ -786,10 +881,11 @@ class OfflineTests(unittest.TestCase):
     def test_signing_requires_complete_g2_chain_team_and_hardened_runtime(self):
         description = ("CodeDirectory v=20500 flags=0x10000(runtime)\n"
                        "Authority=Developer ID Application: Fixture (WN9MP7LBRW)\n"
-                       "Authority=Developer ID Certification Authority G2\n"
+                       "Authority=Developer ID Certification Authority\n"
                        "Authority=Apple Root CA\nTeamIdentifier=WN9MP7LBRW\n")
         self.assertEqual(len(verify_signed_chain(description)), 3)
-        for broken in (description.replace(" G2", ""), description.replace("Apple Root CA", "Other Root"),
+        for broken in (description.replace("Developer ID Certification Authority", "Unrelated Certification Authority"),
+                       description.replace("Apple Root CA", "Other Root"),
                        description.replace("TeamIdentifier=WN9MP7LBRW", "TeamIdentifier=OTHERTEAM1"),
                        description.replace("(runtime)", "(adhoc)")):
             with self.assertRaises(PipelineError):
@@ -802,6 +898,23 @@ class OfflineTests(unittest.TestCase):
         for problem in ("ERROR: fixture failure", "SCRIPT ERROR: fixture failure", "SCRIPTERROR: fixture failure",
                         "Unable to find the .NET assemblies directory.", "Failed to load hostfxr.", "Unhandled exception"):
             self.assertFalse(smoke_passed(0, BOOT_MARKER + "\n" + problem))
+
+    def test_temporary_keychain_registration_and_restore_preserve_other_keychains(self):
+        original = ["/Users/runner/Library/Keychains/login.keychain-db", "/Library/Keychains/Existing.keychain-db"]
+        temporary = "/private/tmp/orvala-macos-104-test/signing.keychain-db"
+        new_other = "/Users/runner/Library/Keychains/Other.keychain-db"
+        registered = merged_keychain_list(original, original, temporary, include_temporary=True)
+        self.assertEqual(registered, [*original, temporary])
+        restored = merged_keychain_list(original, [*registered, new_other], temporary, include_temporary=False)
+        self.assertEqual(restored, [*original, new_other])
+
+    def test_codesign_diagnostic_sanitization_excludes_control_and_key_blocks(self):
+        diagnostic = safe_codesign_stderr(b"\x1b[31mContents/MacOS/Orvala: errSecInternalComponent\x1b[0m\n"
+                                          b"-----BEGIN PRIVATE KEY-----\nfixture-secret\n-----END PRIVATE KEY-----\x00")
+        self.assertIn("errSecInternalComponent", diagnostic)
+        self.assertNotIn("fixture-secret", diagnostic)
+        self.assertNotIn("\x1b", diagnostic)
+        self.assertNotIn("\x00", diagnostic)
 
 
 def run(args) -> None:
@@ -880,8 +993,9 @@ def run(args) -> None:
             evidence["publication"] = {"performed": False}
         write_json(output / "run-result.json", evidence)
         print("PASS: signed, Accepted, stapled, final package reextracted/trusted, native .NET library smoke passed. Visual gameplay was not tested.", flush=True)
-    except Exception:
+    except Exception as error:
         evidence["status"] = "failed_no_portal_promotion"
+        evidence["failure"] = str(error) if isinstance(error, PipelineError) else "Unexpected pipeline failure (details withheld)."
         write_json(output / "run-result.json", evidence)
         raise
     finally:

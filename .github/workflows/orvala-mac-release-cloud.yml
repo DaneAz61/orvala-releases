@@ -86,5 +86,5 @@ jobs:
         if: always()
         run: |
           if test -f "$ORVALA_OUTPUT_DIR/run-result.json"; then
-            cat "$ORVALA_OUTPUT_DIR/run-result.json" >> "$GITHUB_STEP_SUMMARY"
+            tee -a "$GITHUB_STEP_SUMMARY" < "$ORVALA_OUTPUT_DIR/run-result.json"
           fi
