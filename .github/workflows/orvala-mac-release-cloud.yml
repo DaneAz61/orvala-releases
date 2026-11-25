@@ -1,0 +1,87 @@
+name: Orvala Mac public release packaging
+
+# Generic distribution only. No private game/editor sources are checked out or built.
+# Publishing this workflow or adding its temporary Apple secrets needs separate
+# authorization. Manual dispatch is the ONLY trigger; never expose signing to PRs.
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Offline plan, or the separately authorized Apple signing and pre-release publication
+        required: true
+        type: choice
+        default: plan
+        options:
+          - plan
+          - publish
+      confirm_version:
+        description: Type 1.0.4 to authorize the selected publish run
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orvala-macos-104-cloud-release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.repository == 'DaneAz61/orvala-releases' && inputs.operation == 'plan'
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - name: Check out generic distribution orchestration
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: deployment/build-macos/cloud_release.py
+          sparse-checkout-cone-mode: false
+      - name: Audit the pinned plan and offline fixtures
+        run: |
+          python3 deployment/build-macos/cloud_release.py --plan
+          python3 deployment/build-macos/cloud_release.py --self-test
+
+  release:
+    if: github.repository == 'DaneAz61/orvala-releases' && inputs.operation == 'publish' && inputs.confirm_version == '1.0.4'
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      ORVALA_WORK_DIR: ${{ runner.temp }}/orvala-macos-104-${{ github.run_id }}-${{ github.run_attempt }}
+      ORVALA_OUTPUT_DIR: ${{ runner.temp }}/orvala-macos-104-output-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out only generic distribution orchestration
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: deployment/build-macos/cloud_release.py
+          sparse-checkout-cone-mode: false
+      - name: Check generic orchestration before loading Apple secrets
+        run: |
+          python3 deployment/build-macos/cloud_release.py --self-test
+          python3 deployment/build-macos/cloud_release.py --plan
+      - name: Sign, notarize, verify and publish the own Mac pre-release
+        env:
+          APPLE_SIGNING_P12_BASE64: ${{ secrets.APPLE_SIGNING_P12_BASE64 }}
+          APPLE_SIGNING_P12_PASSWORD: ${{ secrets.APPLE_SIGNING_P12_PASSWORD }}
+          APPLE_NOTARY_API_JSON: ${{ secrets.APPLE_NOTARY_API_JSON }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 deployment/build-macos/cloud_release.py
+          --run --publish --confirm-version 1.0.4
+          --work-dir "$ORVALA_WORK_DIR" --output-dir "$ORVALA_OUTPUT_DIR"
+      - name: Remove temporary keychain and signing material
+        if: always()
+        run: >-
+          python3 deployment/build-macos/cloud_release.py
+          --cleanup --work-dir "$ORVALA_WORK_DIR"
+      - name: Record credential-free outcome
+        if: always()
+        run: |
+          if test -f "$ORVALA_OUTPUT_DIR/run-result.json"; then
+            cat "$ORVALA_OUTPUT_DIR/run-result.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
